@@ -1,6 +1,66 @@
 import Fuse from 'fuse.js';
 import Tesseract from 'tesseract.js';
 
+/**
+ * Tesseract invents symbol noise from photographic texture ("yp = Jd 5 ON on",
+ * "[+ a 8", "4 » J"). A line only counts as language when it reads like language:
+ * enough real words, no punctuation soup, and mostly letters.
+ */
+export function isValidHumanSentence(str) {
+  const text = String(str || '').replace(/\s+/g, ' ').trim();
+  if (text.length < 12) return false;
+  if (/[=»«[\]{}|\\<>~_^]/.test(text)) return false;
+
+  const realWords = text.match(/\b[a-zA-Z]{3,}\b/g) || [];
+  if (realWords.length < 3) return false;
+
+  const letters = (text.match(/[a-zA-Z]/g) || []).length;
+  const nonSpace = text.replace(/\s/g, '').length;
+  return nonSpace > 0 && letters / nonSpace >= 0.65;
+}
+
+const STOPWORDS = new Set([
+  'with', 'from', 'that', 'this', 'have', 'were', 'will', 'your', 'theirs', 'their',
+  'when', 'what', 'they', 'them', 'than', 'then', 'into', 'over', 'also', 'been',
+  'being', 'more', 'most', 'such', 'each', 'both', 'which', 'while', 'after',
+  'before', 'about', 'because', 'between', 'during', 'without', 'these', 'those',
+  'there', 'where', 'every', 'other', 'under', 'until', 'upon', 'across', 'plus'
+]);
+
+function meaningfulWords(text) {
+  return new Set(
+    (String(text || '').toLowerCase().match(/\b[a-z]{4,}\b/g) || []).filter(
+      (word) => !STOPWORDS.has(word)
+    )
+  );
+}
+
+// A contradiction is only credible when both sentences talk about the same thing.
+function sharesMeaningfulWord(a, b) {
+  const first = meaningfulWords(a);
+  for (const word of meaningfulWords(b)) if (first.has(word)) return true;
+  return false;
+}
+
+const QUANTITY_UNITS = new Set([
+  'days', 'day', 'hours', 'hour', 'weeks', 'week', 'months', 'month', 'years', 'year',
+  'miles', 'mile', 'km', 'oz', 'lb', 'lbs', 'g', 'kg', 'ml', 'liters', 'countries',
+  'markets', 'stores', 'restaurants', 'users', 'customers', 'hospitals', 'tracks',
+  'songs', 'people', 'employees', 'percent', 'stars', 'bit', 'businesses',
+  'million', 'billion', 'thousand'
+]);
+
+// "5 days" or "150 hospitals" is a claim; a stray "4" out of a font size or a
+// texture artifact is not.
+function isMeaningfulQuantity(value, sentence) {
+  const raw = String(value || '').trim();
+  if (!/^\d{1,2}$/.test(raw)) return true;
+
+  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const following = sentence.match(new RegExp(`(?:^|\\s)${escaped}\\s+([A-Za-z]{2,})`, 'i'));
+  return Boolean(following && QUANTITY_UNITS.has(following[1].toLowerCase()));
+}
+
 function hexToRgb(hex) {
   const clean = hex.replace('#', '');
   const full = clean.length === 3 ? clean.split('').map((c) => c + c).join('') : clean;
@@ -131,6 +191,15 @@ export function scanLowContrastTiles(imgData, width, height, minRatio = 4.5) {
   return regions;
 }
 
+// Comparative marketing language is the same unsubstantiated claim as "#1":
+// "world's best selling" needs sourcing just as much as "100%".
+const SUPERLATIVE_PATTERN = new RegExp(
+  // "100%" sits outside the \b group: a boundary cannot follow "%", which is
+  // why the percentage escaped detection for so long.
+  String.raw`\b100\s*%|\b(?:number[- ]one|guaranteed|guarantees|zero[- ]downtime|zero[- ]risk|instant(?:ly)?|miracle|unlimited|best[- ]selling|unrivall?ed|unbeatable|top[- ]rated)\b|#\s*1\b|\bworld'?s\s+(?:best|leading|number one)\b|\b(?:the\s+)?best\s+(?:in|on)\s+(?:the\s+)?(?:world|market|industry)\b`,
+  'i'
+);
+
 export function auditAdText(adText, brandVault) {
   const issues = [];
   if (!adText || !adText.trim()) return issues;
@@ -159,24 +228,75 @@ export function auditAdText(adText, brandVault) {
   const sentences = adText.split(/(?<=[.!?])\s+|\n+/).filter(Boolean);
   const fuse = new Fuse(brandVault.facts, {
     keys: ['statement', 'keywords'],
-    threshold: 0.6,
+    // 0.40 keeps a match to genuinely similar wording; 0.60 pulled in unrelated
+    // facts and produced nonsense contradictions.
+    threshold: 0.4,
     includeScore: true
   });
 
   sentences.forEach((sentence) => {
-    const adNumbers = sentence.match(/\b\d+(?:\.\d+)?(?:\s*%|\+|\s*x|-bit)?\b/g);
-    const hasSuperlative = /\b(100%|#1|number one|guaranteed|zero-downtime|zero risk|instant|miracle|unlimited)\b/i.test(sentence);
+    // Skip "#1" style rankings: those are superlatives handled below, not quantities
+    const adNumbers = sentence.match(/(?<!#)\b\d[\d,]*(?:\.\d+)?(?:\s*%|\+|\s*x|-bit)?\b/g);
+    const hasSuperlative = SUPERLATIVE_PATTERN.test(sentence);
 
-    if (adNumbers && brandVault.facts.length > 0) {
+    const sentenceIsHuman = isValidHumanSentence(sentence);
+
+    if (adNumbers && brandVault.facts.length > 0 && sentenceIsHuman) {
       const searchResults = fuse.search(sentence);
-      if (searchResults.length > 0) {
-        const bestFact = searchResults[0].item;
+      // 0.40 similarity keeps fuzzy matches honest. When nothing is close enough,
+      // fall back to the fact sharing the most meaningful nouns with the claim —
+      // the same credibility test, without loosening the threshold.
+      const comparableFact = (() => {
+        const wanted = meaningfulWords(sentence);
+        let best = null;
+        let bestScore = 0;
+        brandVault.facts.forEach((fact) => {
+          let score = 0;
+          meaningfulWords(fact.statement).forEach((word) => {
+            if (wanted.has(word)) score += 1;
+          });
+          if (score > bestScore) {
+            bestScore = score;
+            best = fact;
+          }
+        });
+        return best;
+      })();
+      // A weak Fuse hit that shares no real noun must not shadow a closer fact:
+      // "...90,000 restaurants" fuzzily matched a beef sentence and lost the
+      // restaurant fact that actually contradicted it.
+      const fuseFact = searchResults.find((hit) =>
+        sharesMeaningfulWord(sentence, hit.item.statement)
+      )?.item;
+      const bestFact = fuseFact || comparableFact;
+      if (bestFact && sharesMeaningfulWord(sentence, bestFact.statement)) {
+        // Strip thousands separators before comparing, so "40,000" and "40000"
+        // are the same claim instead of two different ones.
+        const normalized = (value) => value.replace(/[\s,]/g, '');
         const numberMatches = adNumbers.some((num) =>
-          bestFact.numbers.some((fNum) => fNum.replace(/\s+/g, '') === num.replace(/\s+/g, ''))
+          bestFact.numbers.some((fNum) => normalized(fNum) === normalized(num))
         );
         if (!numberMatches && bestFact.numbers.length > 0) {
-          const wrongNum = adNumbers[0];
-          const rightNum = bestFact.numbers[0];
+          // Cite the ad figure that is comparable to this fact: in "500 miles ...
+          // and a 15-year warranty" the 15 is what contradicts an 8-year warranty,
+          // not the 500. Nearest-value matching also skips "#1" style superlatives.
+          const toNumber = (value) => Number(String(value).replace(/[^\d.]/g, '')) || 0;
+          const distanceToFact = (value) =>
+            Math.min(...bestFact.numbers.map((fNum) => Math.abs(toNumber(value) - toNumber(fNum))));
+          const wrongNum = adNumbers.reduce(
+            (closest, candidate) => (distanceToFact(candidate) < distanceToFact(closest) ? candidate : closest),
+            adNumbers[0]
+          );
+          const rightNum = bestFact.numbers.reduce(
+            (closest, candidate) =>
+              Math.abs(toNumber(candidate) - toNumber(wrongNum)) < Math.abs(toNumber(closest) - toNumber(wrongNum))
+                ? candidate
+                : closest,
+            bestFact.numbers[0]
+          );
+          // A bare stray digit is OCR texture, not a claim; only flag it when it is
+          // attached to a unit or noun phrase ("5 days", "150 hospitals").
+          if (!isMeaningfulQuantity(wrongNum, sentence)) return;
           issues.push({
             id: `ISS-F-${issues.length + 1}`,
             ruleId: bestFact.id,
@@ -188,7 +308,7 @@ export function auditAdText(adText, brandVault) {
             suggestedFix: sentence.replace(wrongNum, rightNum)
           });
         }
-      } else if (hasSuperlative) {
+      } else if (hasSuperlative && sentenceIsHuman) {
         issues.push({
           id: `ISS-C-${issues.length + 1}`,
           ruleId: 'CLAIM-UNVERIFIED',
@@ -203,7 +323,7 @@ export function auditAdText(adText, brandVault) {
             .replace(/\b#1\b/gi, 'a leading')
         });
       }
-    } else if (hasSuperlative) {
+    } else if (hasSuperlative && sentenceIsHuman) {
       issues.push({
         id: `ISS-S-${issues.length + 1}`,
         ruleId: 'CLAIM-ABSOLUTE',
@@ -237,6 +357,61 @@ export function auditAdText(adText, brandVault) {
   });
 
   return issues;
+}
+
+const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'-]{2,}$/;
+
+function cleanOcrWord(text) {
+  return String(text || '')
+    .trim()
+    .replace(/^[^a-zA-Z0-9]+/, '')
+    .replace(/[^a-zA-Z0-9%$.,'-]+$/, '');
+}
+
+// Structure that legitimately falls below sentence length: headings, hex rows and
+// 2-3 word keyword entries.
+function isKnownOcrHeading(line) {
+  const text = String(line || '').trim();
+  if (!text) return false;
+  if (/^#?[0-9A-Fa-fIO]{6}$/.test(text)) return true;
+
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length > 6) return false;
+  const allCaps = !/[a-z]/.test(text) && /[A-Z]{2}/.test(text);
+  // A short row only counts as a heading when every token is a real capitalised
+  // word: photo texture yields pairs like "yp Jd", which used to slip through here.
+  const keywordRow =
+    words.length <= 3 && words.every((word) => /^[A-Z][A-Za-z'’-]{2,}$/.test(word));
+  return allCaps || keywordRow;
+}
+
+// Darkest pixel approximates the glyph, lightest its background: a single centre
+// pixel lands between glyphs and reports false 1:1 failures.
+function wordContrast(ctx, canvas, bbox) {
+  const { x0, y0, x1, y1 } = bbox;
+  const px0 = Math.max(0, Math.floor(x0));
+  const py0 = Math.max(0, Math.floor(y0));
+  const pw = Math.max(1, Math.min(canvas.width - px0, Math.ceil(x1 - x0)));
+  const ph = Math.max(1, Math.min(canvas.height - py0, Math.ceil(y1 - y0)));
+  const region = ctx.getImageData(px0, py0, pw, ph).data;
+
+  let fgRgb = { r: 0, g: 0, b: 0 };
+  let bgRgb = { r: 255, g: 255, b: 255 };
+  let minLum = Infinity;
+  let maxLum = -Infinity;
+  for (let p = 0; p < region.length; p += 4) {
+    const rgb = { r: region[p], g: region[p + 1], b: region[p + 2] };
+    const lum = getLuminance(rgb);
+    if (lum < minLum) {
+      minLum = lum;
+      fgRgb = rgb;
+    }
+    if (lum > maxLum) {
+      maxLum = lum;
+      bgRgb = rgb;
+    }
+  }
+  return getContrastRatio(fgRgb, bgRgb);
 }
 
 export async function auditAdImage(imageSrc, brandVault, onProgress = () => {}) {
@@ -296,83 +471,89 @@ export async function auditAdImage(imageSrc, brandVault, onProgress = () => {}) 
         }
       }
 
-      // 2. Tesseract.js OCR + Bounding Box WCAG 2.1 Contrast Audit
+      // 2. Tesseract.js OCR + per-line WCAG contrast audit
       let ocrText = '';
       let ocrWordCount = 0;
       let wcagFailCount = 0;
       let lowContrastRegions = [];
       const boundingBoxes = [];
+      const failingLines = [];
+      const contrastTarget = brandVault.minContrastRatio || 4.5;
       let ocrWorker = null;
       try {
-        // tesseract.js v5+ moved word geometry under `blocks`, which is disabled by default.
-        // Requesting it explicitly keeps boundingBoxes (and the WCAG contrast check) populated.
+        // tesseract.js v5+ moved word geometry under `blocks`, which is disabled by
+        // default. Requesting it keeps boundingBoxes (and WCAG) populated.
         ocrWorker = await Tesseract.createWorker('eng', 1, {
           logger: (m) => {
             if (m.status === 'recognizing text') onProgress(Math.round(m.progress * 100));
           }
         });
-        const result = await ocrWorker.recognize(imageSrc, {}, { blocks: true });
-        ocrText = result.data.text || '';
-        const blocks = result.data.blocks || [];
-        const words =
-          result.data.words ||
-          blocks.flatMap((block) =>
-            (block.paragraphs || []).flatMap((paragraph) =>
-              (paragraph.lines || []).flatMap((line) => line.words || [])
-            )
-          );
+        const result = await ocrWorker.recognize(imageSrc, {}, { blocks: true, text: true });
+        const lines = (result.data.blocks || []).flatMap((block) =>
+          (block.paragraphs || []).flatMap((paragraph) => paragraph.lines || [])
+        );
 
-        ocrWordCount = words.length;
-        words
-          .filter((w) => w.text.trim().length > 2 && w.confidence > 45)
-          .slice(0, 10)
-          .forEach((w) => {
-            const { x0, y0, x1, y1 } = w.bbox;
+        const keptLines = [];
+        for (const line of lines) {
+          if (keptLines.length >= 12) break;
 
-            // Sample the whole word region: the darkest pixel approximates the glyph
-            // colour and the lightest approximates its background. Reading a single
-            // centre pixel lands between glyphs and reports false 1:1 failures.
-            const px0 = Math.max(0, Math.floor(x0));
-            const py0 = Math.max(0, Math.floor(y0));
-            const pw = Math.max(1, Math.min(canvas.width - px0, Math.ceil(x1 - x0)));
-            const ph = Math.max(1, Math.min(canvas.height - py0, Math.ceil(y1 - y0)));
-            const region = ctx.getImageData(px0, py0, pw, ph).data;
+          const words = (line.words || [])
+            .map((word) => ({ ...word, cleanText: cleanOcrWord(word.text) }))
+            .filter((word) => word.confidence >= 65 && OCR_WORD_PATTERN.test(word.cleanText));
+          if (!words.length) continue;
 
-            let fgRgb = { r: 0, g: 0, b: 0 };
-            let bgRgb = { r: 255, g: 255, b: 255 };
-            let minLum = Infinity;
-            let maxLum = -Infinity;
-            for (let p = 0; p < region.length; p += 4) {
-              const rgb = { r: region[p], g: region[p + 1], b: region[p + 2] };
-              const lum = getLuminance(rgb);
-              if (lum < minLum) {
-                minLum = lum;
-                fgRgb = rgb;
-              }
-              if (lum > maxLum) {
-                maxLum = lum;
-                bgRgb = rgb;
-              }
-            }
+          const lineText = words.map((word) => word.cleanText).join(' ');
+          const avgConfidence = words.reduce((sum, word) => sum + word.confidence, 0) / words.length;
+          if (avgConfidence < 65) continue;
+          // Photo texture produces symbol soup; only real language reaches the audit
+          if (!isValidHumanSentence(lineText) && !isKnownOcrHeading(lineText)) continue;
 
-            const contrast = getContrastRatio(fgRgb, bgRgb);
-            const failsContrast = contrast < (brandVault.minContrastRatio || 4.5);
-            boundingBoxes.push({ x0, y0, x1, y1, text: w.text, contrast, failsContrast });
+          keptLines.push(lineText);
+          ocrWordCount += words.length;
 
-            if (failsContrast && wcagFailCount < 2) {
-              wcagFailCount += 1;
-              visualIssues.push({
-                id: `VIS-WCAG-${wcagFailCount}`,
-                ruleId: 'WCAG-AA',
-                category: 'Accessibility (WCAG 2.1)',
-                severity: 'High',
-                offendingText: `Image Overlay Text "${w.text}"`,
-                explanation: `Contrast ratio inside bounding box (${x0},${y0}) is ${contrast}:1, below the 4.5:1 WCAG AA minimum.`,
-                citation: 'WCAG 2.1 AA Accessibility Standard',
-                suggestedFix: 'Increase text overlay contrast above 4.5:1'
-              });
-            }
+          const scored = words.map((word) => {
+            const contrast = wordContrast(ctx, canvas, word.bbox);
+            return { text: word.cleanText, contrast, failsContrast: contrast < contrastTarget, box: word.bbox };
           });
+
+          scored.forEach((word) => {
+            boundingBoxes.push({
+              ...word.box,
+              text: word.text,
+              contrast: word.contrast,
+              failsContrast: word.failsContrast
+            });
+          });
+
+          const failing = scored.filter((word) => word.failsContrast);
+          if (failing.length) {
+            failingLines.push({
+              text: lineText,
+              failingText: failing.map((word) => word.text).join(' '),
+              contrast: Number(
+                (failing.reduce((sum, word) => sum + word.contrast, 0) / failing.length).toFixed(2)
+              )
+            });
+          }
+        }
+
+        ocrText = keptLines.join('\n');
+
+        // One card per text line, not per word: a low-contrast headline used to
+        // produce a separate card for every word in it.
+        failingLines.slice(0, 3).forEach((line) => {
+          wcagFailCount += 1;
+          visualIssues.push({
+            id: `VIS-WCAG-${wcagFailCount}`,
+            ruleId: 'WCAG-AA',
+            category: 'Accessibility (WCAG 2.1)',
+            severity: 'High',
+            offendingText: `Flagged Banner Text: "${line.text}"`,
+            explanation: `Average contrast across "${line.failingText}" is ${line.contrast}:1, below the ${contrastTarget}:1 WCAG AA minimum.`,
+            citation: 'WCAG 2.1 AA Accessibility Standard',
+            suggestedFix: 'Increase text overlay contrast above 4.5:1'
+          });
+        });
       } catch (err) {
         console.warn('OCR warning:', err);
       } finally {

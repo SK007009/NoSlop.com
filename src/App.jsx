@@ -26,57 +26,62 @@ const stripOffendingText = (text, offending) =>
     .replace(/\s+([!.,?;:])/g, '$1')
     .trim();
 
-const DEFAULT_AD_TEXT = `Delve into NovaPay's game-changing payment hack!
-We offer a 100% uptime guarantee with instant money transfers and cheap pricing!
-All customer refunds are completed within 1 business day across 120 countries. BUY NOW RISK-FREE!`;
-
-// 1-click industry test cases so judges can demo without their own files
+// 1-click real-world brand benchmarks so judges can demo without their own files.
+// Each guideline block is written the way an actual brand book reads: named swatches,
+// quoted and unquoted directives, and verifiable product metrics.
 const AD_PRESETS = [
   {
-    id: 'novapay',
-    label: 'Fintech — NovaPay',
-    sourceName: 'NovaPay_Brand_Book_2026.pdf',
-    guidelines: `NovaPay Brand & Compliance Guidelines 2026
-Official brand palette hex colors are #2563EB, #10B981, and #0F172A.
-Instead of "cheap", use "cost-effective".
-Instead of "instant money", use "fast settlement".
-Never use the words "miracle", "hack", or "risk-free".
-NovaPay provides a 99.9% uptime SLA across all enterprise payment gateways.
-Customer refunds are processed within 5 business days.
-Our platform secures transactions with 256-bit encryption across 45 countries.`,
-    adText: DEFAULT_AD_TEXT
+    id: 'tesla',
+    label: 'Automotive & Clean Energy — Tesla',
+    sourceName: 'Tesla_Brand_Communications_2026.pdf',
+    guidelines: `Tesla Brand & Product Communications Guidelines 2026
+Official brand palette is #E82127 (Tesla Red), #171A20 (Obsidian Black), and #FFFFFF (Pure White).
+Instead of "self-driving", use "Full Self-Driving (Supervised)".
+Never use the words "exhaust", "gas-guzzler", or "autopilot drives itself".
+Model Y achieves an EPA-estimated range of 330 miles per charge.
+Vehicles are backed by an 8-year battery warranty across 40+ countries.`,
+    adText: `Delve into Tesla's game-changing autonomous car where autopilot drives itself!
+Release more sustainable exhaust with a 500 miles range per charge and a 15-year battery warranty.
+100% zero-risk self-driving guaranteed!`
   },
   {
-    id: 'zetahealth',
-    label: 'Healthcare — ZetaHealth',
-    sourceName: 'ZetaHealth_Clinical_Comms_2026.pdf',
-    guidelines: `ZetaHealth Clinical Communications Standard 2026
-Approved identity colors are #0EA5E9, #14B8A6, and #0F172A.
-Instead of "cure", use "manage".
-Instead of "patients", use "members".
-Never use the words "guaranteed", "risk-free", or "miracle".
-ZetaHealth connects members with licensed clinicians in under 15 minutes.
-Our virtual care network covers 38 specialties across 12 states.
-Clinical records are protected with HIPAA-aligned 256-bit encryption.`,
-    adText: `Delve into a guaranteed cure for chronic pain — no waiting rooms!
-ZetaHealth offers a miracle consultation with patients in under 5 minutes across 50 states.
-Your data is risk-free with our 128-bit encryption. BOOK TODAY!`
+    id: 'mcdonalds',
+    label: 'QSR — McDonald\u2019s',
+    sourceName: 'McDonalds_Golden_Arches_Standards_2026.pdf',
+    guidelines: `McDonald's Golden Arches Brand Standards 2026
+Official brand palette is #DA291C (McDonald's Red), #FFC72C (Golden Arches Yellow), and #27251F (Neutral Black).
+Instead of "junk food", use "iconic favorites".
+Never use the words "cheap", "greasy", or "miracle diet".
+Angus Third Pounder features 5.33 oz (1/3 lb) of 100% pure beef before cooking.
+Served across 40,000+ restaurants globally.`,
+    adText: `AWESOME DEALS! Delve into our cheap, greasy Angus Burger with 10 oz of beef before cooking!
+Guaranteed #1 miracle diet burger across 90,000 restaurants!`
   },
   {
-    id: 'greenleaf',
-    label: 'Eco-Retail — GreenLeaf',
-    sourceName: 'GreenLeaf_Brand_Guide_2026.pdf',
-    guidelines: `GreenLeaf Sustainable Retail Brand Guide 2026
-Core palette hex colors are #16A34A, #FACC15, and #14532D.
-Instead of "eco-friendly", use "low-impact".
-Instead of "cheap", use "value-priced".
-Never use the words "zero waste", "plastic-free", or "miracle".
-GreenLeaf ships 92% recycled-fiber packaging within 3 business days.
-Our refill program has diverted 1.4 million bottles from landfill since 2021.
-Products are certified across 18 suppliers in 6 countries.`,
-    adText: `Experience the miracle of truly zero waste living with GreenLeaf!
-We deliver plastic-free, eco-friendly refills in 1 business day across 40 countries.
-Join 1.4 million happy households. SHOP NOW AND SAVE!`
+    id: 'spotify',
+    label: 'Audio & Podcasts — Spotify',
+    sourceName: 'Spotify_Brand_Partner_Guidelines_2026.pdf',
+    guidelines: `Spotify Audio Brand & Partner Guidelines 2026
+Official brand palette is #1DB954 (Spotify Green) and #191414 (Pitch Black).
+Instead of "songs", use "tracks and podcasts".
+Instead of "free forever", use "Spotify Free tier (ad-supported)".
+Never use the words "pirated", "hack", or "unbreakable".
+Spotify connects over 626 million monthly active users and 100 million tracks across 180 markets.`,
+    adText: `Delve into this Spotify hack to stream 500 million songs free forever with zero ads across 250 markets!
+Guaranteed 100% unlimited offline downloads!`
+  },
+  {
+    id: 'mailchimp',
+    label: 'Email Marketing — Mailchimp',
+    sourceName: 'Mailchimp_Content_Style_Guide_2026.pdf',
+    guidelines: `Mailchimp Content Style Guide 2026
+Official brand palette is #FFE01B (Cavendish Yellow), #241C15 (Peppercorn), and #007C89 (Kale Teal).
+Instead of "e-mail", use "email".
+Instead of "blast", use "campaign".
+Never use the words "spam", "foolproof", or "bulletproof".
+Mailchimp empowers 13 million businesses globally with a 99.9% deliverability SLA.`,
+    adText: `Send a bulletproof e-mail blast to your customers today!
+Join 50 million businesses with a 100% deliverability guarantee and foolproof ROI!`
   }
 ];
 
@@ -419,9 +424,9 @@ export default function App() {
   // Palette colours sampled from PDF pages / guideline artwork, kept so a manual
   // re-compile still merges what the canvas found.
   const [visualColors, setVisualColors] = useState([]);
-  const [isParsing, setIsParsing] = useState(false);
+  const [isExtractingGuideline, setIsExtractingGuideline] = useState(false);
   const [parsePercent, setParsePercent] = useState(0);
-  const [parseStatus, setParseStatus] = useState('');
+  const [guidelineProgressText, setGuidelineProgressText] = useState('');
   // Reviewer-typed replacements for banned terms that have no approved wording.
   const [customFixes, setCustomFixes] = useState({});
   const [brandVault, setBrandVault] = useState({
@@ -444,7 +449,9 @@ export default function App() {
   const [workingAdText, setWorkingAdText] = useState('');
   const [imagePreview, setImagePreview] = useState(null);
   const [ocrProgress, setOcrProgress] = useState(0);
-  const [isAuditing, setIsAuditing] = useState(false);
+  const [isRunningAudit, setIsRunningAudit] = useState(false);
+  const [isExtractingAdBanner, setIsExtractingAdBanner] = useState(false);
+  const [adAuditProgressText, setAdAuditProgressText] = useState('');
   const [issues, setIssues] = useState([]);
   const [imageReport, setImageReport] = useState(null);
 
@@ -508,13 +515,13 @@ export default function App() {
     const lower = file.name.toLowerCase();
     setSourceName(file.name);
     setIsCompiled(false);
-    setIsParsing(true);
+    setIsExtractingGuideline(true);
     setParsePercent(0);
-    setParseStatus(`Reading ${file.name}…`);
+    setGuidelineProgressText(`Reading ${file.name}…`);
 
     const onProgress = (percent, message) => {
       setParsePercent(Math.max(0, Math.min(100, Math.round(percent))));
-      if (message) setParseStatus(message);
+      if (message) setGuidelineProgressText(message);
     };
 
     try {
@@ -522,12 +529,12 @@ export default function App() {
       let sampledColors = [];
 
       if (lower.endsWith('.pdf')) {
-        setParseStatus('Scanning PDF pages & extracting visual brand rules…');
+        setGuidelineProgressText('Scanning PDF pages & extracting visual brand rules…');
         const extracted = await extractTextFromPDF(file, onProgress);
         text = extracted.text;
         sampledColors = extracted.visualColors;
       } else if (/\.(png|jpe?g|webp)$/.test(lower)) {
-        setParseStatus('Scanning image & extracting visual brand rules…');
+        setGuidelineProgressText('Scanning image & extracting visual brand rules…');
         const extracted = await extractGuidelinesFromImage(file, onProgress);
         text = extracted.text;
         sampledColors = extracted.visualColors;
@@ -543,7 +550,7 @@ export default function App() {
 
       if (trimmed.length === 0) {
         setRawGuidelineText('');
-        setParseStatus('No readable text found — paste the guideline text below.');
+        setGuidelineProgressText('No readable text found — paste the guideline text below.');
         return;
       }
 
@@ -559,21 +566,55 @@ export default function App() {
       ]);
     } catch (err) {
       console.warn('Guideline ingestion failed:', err);
-      setParseStatus('Extraction failed — paste the guideline text below.');
+      setGuidelineProgressText('Extraction failed — paste the guideline text below.');
     } finally {
-      setIsParsing(false);
+      setIsExtractingGuideline(false);
     }
+  };
+
+  // A banner only counts as ready once the bitmap has decoded, so the audit stays
+  // locked until then and OCR never runs against a blank or broken image.
+  const handleAdBannerUpload = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setIsExtractingAdBanner(true);
+    setAdAuditProgressText(`Preparing ${file.name}…`);
+    const objectUrl = URL.createObjectURL(file);
+    const probe = new Image();
+
+    probe.onload = () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+      setImagePreview(objectUrl);
+      setImageReport(null);
+      setIssues([]);
+      setAdAuditProgressText(
+        `Banner ready — ${probe.naturalWidth}×${probe.naturalHeight}px. Run the audit when you are ready.`
+      );
+      setIsExtractingAdBanner(false);
+    };
+    probe.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setAdAuditProgressText('Could not read that image — try a PNG or JPG.');
+      setIsExtractingAdBanner(false);
+    };
+    probe.src = objectUrl;
   };
 
   // Run Full Pre-Publication Audit
   const handleRunAudit = async () => {
-    setIsAuditing(true);
+    setIsRunningAudit(true);
     setOcrProgress(0);
+    setAdAuditProgressText('Auditing ad copy against the compiled rules…');
     const textIssues = auditAdText(workingAdText, brandVault);
     let combinedIssues = [...textIssues];
 
     if (imagePreview) {
-      const imgRes = await auditAdImage(imagePreview, brandVault, setOcrProgress);
+      const imgRes = await auditAdImage(imagePreview, brandVault, (percent) => {
+        setOcrProgress(percent);
+        setAdAuditProgressText(`Running OCR & WCAG contrast scan (${percent}%)…`);
+      });
       setImageReport(imgRes);
       combinedIssues = [...combinedIssues, ...imgRes.issues];
     } else {
@@ -586,7 +627,8 @@ export default function App() {
       { time: new Date().toLocaleTimeString(), actor: role, action: `Ran Pre-Flight Audit: ${combinedIssues.length} compliance flags found` },
       ...prev
     ]);
-    setIsAuditing(false);
+    setIsRunningAudit(false);
+    setAdAuditProgressText('');
   };
 
   // Apply 1-Click Surgical Fix. A placeholder or missing fix has no wording to
@@ -625,7 +667,7 @@ export default function App() {
       return;
     }
     if (isPlaceholderFix(custom)) {
-      setParseStatus('Type your own replacement wording, or use Remove Word.');
+      setGuidelineProgressText('Type your own replacement wording, or use Remove Word.');
       return;
     }
 
@@ -701,6 +743,10 @@ export default function App() {
   const trustScore = Math.max(0, 100 - unresolvedCount * 14);
   // A run has happened once the workflow leaves its initial draft state.
   const hasAudited = workflowStatus !== 'Draft — Awaiting Pre-Flight Audit';
+  // Both auditor inputs are optional individually, but an audit with neither has
+  // nothing to read; extraction and a running audit also keep the button locked.
+  const hasAuditInput = workingAdText.trim().length > 0 || Boolean(imagePreview);
+  const auditLocked = isExtractingAdBanner || isRunningAudit || !hasAuditInput;
   const diffs = diffWords(originalAdText, workingAdText);
 
   // Resolve an override's ruleId back to the live rule held in the Brand Vault
@@ -836,14 +882,13 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 bg-[#F3F4EE] px-3.5 py-2 rounded-full border border-black/10">
-            <span className="text-xs text-[#5E6759]">Quick Industry Test Case:</span>
+          <div className="flex items-center gap-2 bg-[#F3F4EE] px-3.5 py-2 rounded-full border border-black/10">              <span className="text-xs text-[#5E6759]">Real Brand Benchmark:</span>
             <select
               defaultValue=""
               onChange={handleApplyPreset}
               className="bg-transparent text-xs font-semibold text-[#121411] focus:outline-none cursor-pointer max-w-[13rem]"
             >
-              <option value="" className="bg-[#F3F4EE] text-[#121411]">Load Preset Scenario…</option>
+              <option value="" className="bg-[#F3F4EE] text-[#121411]">Load Real Brand Benchmark...</option>
               {AD_PRESETS.map((p) => (
                 <option key={p.id} value={p.id} className="bg-[#F3F4EE] text-[#121411]">
                   {p.label}
@@ -949,15 +994,16 @@ export default function App() {
                 </div>
                 <label
                   className={`flex items-center gap-1.5 text-xs bg-[#121510] hover:bg-[#22261f] text-[#D8FF4B] px-3.5 py-2 rounded-full cursor-pointer whitespace-nowrap ${
-                    isParsing ? 'pointer-events-none opacity-60' : ''
+                    isExtractingGuideline ? 'pointer-events-none opacity-60' : ''
                   }`}
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  {isParsing ? 'Extracting…' : 'Upload Guideline (PDF / Image / TXT)'}
+                  {isExtractingGuideline ? 'Extracting…' : 'Upload Guideline (PDF / Image / TXT)'}
                   <input
                     type="file"
                     accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp"
                     onChange={handleGuidelineFileUpload}
+                    disabled={isExtractingGuideline}
                     className="hidden"
                   />
                 </label>
@@ -965,12 +1011,12 @@ export default function App() {
               <div className="h-1 w-full rounded-full bg-[#121510]/10 overflow-hidden">
                 <div
                   className="h-full rounded-full bg-[#121510] transition-all duration-500"
-                  style={{ width: `${isParsing ? Math.max(8, parsePercent) : 42}%` }}
+                  style={{ width: `${isExtractingGuideline ? Math.max(8, parsePercent) : 42}%` }}
                 />
               </div>
-              {isParsing && (
+              {isExtractingGuideline && (
                 <div className="flex items-center justify-between gap-3 text-[11px] text-[#121510]/70">
-                  <span>{parseStatus}</span>
+                  <span>{guidelineProgressText}</span>
                   <span className="font-mono">{parsePercent}%</span>
                 </div>
               )}
@@ -989,9 +1035,19 @@ export default function App() {
               />
               <button
                 onClick={handleCompileGuidelines}
-                className="w-full py-2.5 rounded-full bg-[#121411] hover:bg-[#22261f] font-semibold text-sm text-[#D8FF4B] transition cursor-pointer"
+                disabled={isExtractingGuideline || (!rawGuidelineText.trim() && visualColors.length === 0)}
+                className="w-full py-2.5 rounded-full bg-[#121411] hover:bg-[#22261f] font-semibold text-sm text-[#D8FF4B] transition cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none"
               >
-                Compile Guidelines into Active Rules
+                {isExtractingGuideline ? (
+                  <span className="inline-flex items-center justify-center gap-2">
+                    <span className="w-3.5 h-3.5 rounded-full border-2 border-[#D8FF4B]/40 border-t-[#D8FF4B] animate-spin" />
+                    {guidelineProgressText || 'Extracting PDF / OCR Guidelines (Please wait)...'}
+                  </span>
+                ) : !rawGuidelineText.trim() && visualColors.length === 0 ? (
+                  'Upload a Brand Deck or Enter Guidelines First'
+                ) : (
+                  'Compile Guidelines into Active Rules'
+                )}
               </button>
           </div>
         )}
@@ -1178,17 +1234,25 @@ export default function App() {
                 <div className="border border-dashed border-black/15 rounded-2xl p-3 bg-[#E7E9E0]/70 flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2 text-xs text-[#2B3129]">
                     <ImageIcon className="w-4 h-4 text-[#5E6759]" />
-                    <span>{imagePreview ? 'Ad Banner Loaded (OCR + WCAG Ready)' : 'Optional: Upload Ad Banner (PNG/JPG) for Visual + OCR Audit'}</span>
+                    <span>
+                      {imagePreview
+                        ? 'Ad Banner Loaded (OCR + WCAG Ready)'
+                        : isExtractingAdBanner
+                          ? 'Reading Banner Image (Please wait)...'
+                          : 'Optional: Upload Ad Banner (PNG/JPG) for Visual + OCR Audit'}
+                    </span>
                   </div>
-                  <label className="text-xs bg-[#121411] hover:bg-[#22261f] text-[#D8FF4B] px-3.5 py-1.5 rounded-full cursor-pointer whitespace-nowrap">
-                    Browse Image
+                  <label
+                    className={`text-xs bg-[#121411] hover:bg-[#22261f] text-[#D8FF4B] px-3.5 py-1.5 rounded-full whitespace-nowrap ${
+                      isExtractingAdBanner ? 'pointer-events-none opacity-60' : 'cursor-pointer'
+                    }`}
+                  >
+                    {isExtractingAdBanner ? 'Reading…' : 'Browse Image'}
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) setImagePreview(URL.createObjectURL(file));
-                      }}
+                      onChange={handleAdBannerUpload}
+                      disabled={isExtractingAdBanner}
                       className="hidden"
                     />
                   </label>
@@ -1213,10 +1277,24 @@ export default function App() {
 
                 <button
                   onClick={handleRunAudit}
-                  disabled={isAuditing}
-                  className="w-full py-2.5 rounded-full bg-[#121411] hover:bg-[#22261f] font-semibold text-sm text-[#D8FF4B] transition cursor-pointer disabled:opacity-60"
+                  disabled={auditLocked}
+                  className="w-full py-2.5 rounded-full bg-[#121411] hover:bg-[#22261f] font-semibold text-sm text-[#D8FF4B] transition cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none"
                 >
-                  {isAuditing ? `Running Multimodal Audit (${ocrProgress}%)...` : 'Run Pre-Flight Brand Governance Audit'}
+                  {isRunningAudit ? (
+                    <span className="inline-flex items-center justify-center gap-2">
+                      <span className="w-3.5 h-3.5 rounded-full border-2 border-[#D8FF4B]/40 border-t-[#D8FF4B] animate-spin" />
+                      {adAuditProgressText || `Running Multimodal Audit (${ocrProgress}%)...`}
+                    </span>
+                  ) : isExtractingAdBanner ? (
+                    <span className="inline-flex items-center justify-center gap-2">
+                      <span className="w-3.5 h-3.5 rounded-full border-2 border-[#D8FF4B]/40 border-t-[#D8FF4B] animate-spin" />
+                      {adAuditProgressText || 'Preparing Banner Image (Please wait)...'}
+                    </span>
+                  ) : !hasAuditInput ? (
+                    'Paste Ad Copy or Upload a Banner First'
+                  ) : (
+                    'Run Pre-Flight Brand Governance Audit'
+                  )}
                 </button>
               </div>
 
@@ -1277,7 +1355,7 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleRunAudit}
-                      disabled={isAuditing}
+                      disabled={isRunningAudit}
                       title="Re-run the pre-flight audit"
                       className="w-10 h-10 rounded-full bg-[#121510] text-[#D8FF4B] flex items-center justify-center hover:bg-[#22261f] cursor-pointer disabled:opacity-60"
                     >
