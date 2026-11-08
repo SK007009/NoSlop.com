@@ -68,6 +68,17 @@ function hexToRgb(hex) {
   return { r: (num >> 16) & 255, g: (num >> 8) & 255, b: num & 255 };
 }
 
+// HSL saturation of a colour: the difference between a brand hue and a grey. A
+// calibration bar (#A0A0A0) and a white margin both read 0 here.
+function hslSaturation({ r, g, b }) {
+  const max = Math.max(r, g, b) / 255;
+  const min = Math.min(r, g, b) / 255;
+  const delta = max - min;
+  if (delta === 0) return 0;
+  const lightness = (max + min) / 2;
+  return delta / (1 - Math.abs(2 * lightness - 1));
+}
+
 function getLuminance({ r, g, b }) {
   const a = [r, g, b].map((v) => {
     v /= 255;
@@ -200,15 +211,89 @@ const SUPERLATIVE_PATTERN = new RegExp(
   'i'
 );
 
-export function auditAdText(adText, brandVault) {
+// Words a brand's own fact ledger uses that carry no identity signal. They are too
+// common to prove an ad belongs to a brand, so they never count as a marker.
+const IDENTITY_STOPWORDS = new Set([
+  'about', 'after', 'also', 'been', 'before', 'being', 'between', 'brand', 'brands',
+  'could', 'every', 'first', 'found', 'from', 'have', 'into', 'more', 'most', 'other',
+  'over', 'shall', 'should', 'since', 'some', 'such', 'than', 'that', 'their', 'them',
+  'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until',
+  'upon', 'very', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'within',
+  'without', 'would', 'your', 'years', 'guideline', 'guidelines', 'branding'
+]);
+
+/**
+ * The vocabulary that proves an ad belongs to this brand: its name, the words of
+ * its name, and the distinctive nouns its own guidelines repeat ("coffee",
+ * "espresso", "Angus"). A Nike headline has none of these.
+ */
+function brandIdentityMarkers(brandVault) {
+  const markers = new Set();
+  const add = (value) => {
+    const term = String(value || '').toLowerCase().replace(/[’‘]/g, "'").trim();
+    if (term.length >= 3) markers.add(term);
+  };
+
+  add(brandVault.brandName);
+  String(brandVault.brandName || '')
+    .split(/\s+/)
+    .forEach(add);
+  (brandVault.facts || []).forEach((fact) => {
+    (String(fact.statement || '').toLowerCase().match(/\b[a-z][a-z'’-]{3,}\b/g) || []).forEach(
+      (word) => {
+        if (!IDENTITY_STOPWORDS.has(word)) add(word);
+      }
+    );
+  });
+  return markers;
+}
+
+// A cross-brand creative is the failure a colour check cannot catch: the poster is
+// beautifully made, but nothing on it belongs to the brand whose rules are loaded.
+function auditBrandIdentity(text, brandVault, { label = 'Ad copy', verb = 'contains' } = {}) {
+  const brandName = String(brandVault?.brandName || '').trim();
+  // Normalised but not lowercased: the offender is quoted back as the designer
+  // typed it ("YOU CAN'T WIN."), while matching still ignores case.
+  const normalized = String(text || '')
+    .replace(/[’‘]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+  const haystack = normalized.toLowerCase();
+  if (!brandName || !haystack) return null;
+
+  for (const marker of brandIdentityMarkers(brandVault)) {
+    if (haystack.includes(marker)) return null;
+  }
+
+  const excerpt = normalized.slice(0, 80);
+  return {
+    id: 'ISS-BRAND-1',
+    ruleId: 'BRAND-IDENTITY',
+    category: 'Cross-Brand / Brand Identity',
+    severity: 'High',
+    offendingText: excerpt,
+    explanation: `${label} ('${excerpt}') ${verb} zero required ${brandName} brand identity markers or lockups.`,
+    citation: `${brandVault.sourceName}: Brand Identity & Lockup Requirements`,
+    suggestedFix: `Show the ${brandName} wordmark or an approved ${brandName} brand line, and remove other brands' campaign language.`
+  };
+}
+
+export function auditAdText(adText, brandVault, { label = 'Ad copy', verb = 'contains' } = {}) {
   const issues = [];
   if (!adText || !adText.trim()) return issues;
 
   // 1. Banned Terms & AI-Slop Check
   brandVault.bannedTerms.forEach((rule) => {
     if (!rule.term) return;
-    const escaped = rule.term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
+    // A term may itself start or end with punctuation ("% off"), so the word
+    // boundaries are added only where a word character actually sits. Apostrophes
+    // match either glyph: a guideline's "can't" has to catch an ad's "CAN’T".
+    const escaped = rule.term
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/'/g, "['’]");
+    const lead = /^[a-z0-9]/i.test(rule.term) ? '\\b' : '';
+    const trail = /[a-z0-9]$/i.test(rule.term) ? '\\b' : '';
+    const regex = new RegExp(`${lead}${escaped}${trail}`, 'gi');
     let match;
     while ((match = regex.exec(adText)) !== null) {
       issues.push({
@@ -356,33 +441,55 @@ export function auditAdText(adText, brandVault) {
     }
   });
 
+  const identityIssue = auditBrandIdentity(adText, brandVault, { label, verb });
+  if (identityIssue) {
+    issues.push({ ...identityIssue, id: `ISS-BRAND-${issues.length + 1}` });
+  }
+
   return issues;
 }
 
-const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'-]{2,}$/;
+// Curly apostrophes/quotes and ®, & and decimal inches are ordinary brand copy; a
+// word pattern that rejects them silently deleted "CAN’T" and "Starbucks®".
+const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'’‘"“”&®-]{2,}$/;
 
 function cleanOcrWord(text) {
   return String(text || '')
     .trim()
-    .replace(/^[^a-zA-Z0-9]+/, '')
-    .replace(/[^a-zA-Z0-9%$.,'-]+$/, '');
+    .replace(/^[^a-zA-Z0-9.]+/, '')
+    .replace(/[^a-zA-Z0-9%$.,'’‘"“”&®-]+$/, '');
 }
 
-// Structure that legitimately falls below sentence length: headings, hex rows and
-// 2-3 word keyword entries.
-function isKnownOcrHeading(line) {
-  const text = String(line || '').trim();
-  if (!text) return false;
-  if (/^#?[0-9A-Fa-fIO]{6}$/.test(text)) return true;
+// Tesseract often emits the apostrophe of "CAN’T" as its own token, or splits the
+// final T off after it. Re-joining them is the difference between reading CAN’T and
+// silently dropping the word the poster turns on.
+function joinApostropheWords(words) {
+  const joined = [];
+  for (const word of words) {
+    const text = String(word.text || '').trim();
+    const previous = joined[joined.length - 1];
+    if (previous && /^['’‘`´]+$/.test(text) && /[A-Za-z]$/.test(previous.text)) {
+      previous.text += text;
+      continue;
+    }
+    if (previous && /['’‘`´]$/.test(previous.text) && /^[A-Za-z]$/.test(text)) {
+      previous.text += text;
+      continue;
+    }
+    joined.push({ ...word, text });
+  }
+  return joined;
+}
 
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length > 6) return false;
-  const allCaps = !/[a-z]/.test(text) && /[A-Z]{2}/.test(text);
-  // A short row only counts as a heading when every token is a real capitalised
-  // word: photo texture yields pairs like "yp Jd", which used to slip through here.
-  const keywordRow =
-    words.length <= 3 && words.every((word) => /^[A-Z][A-Za-z'’-]{2,}$/.test(word));
-  return allCaps || keywordRow;
+// A poster headline is allowed to be short ("SO WIN.", "JUST DO IT."), so the
+// banner gate asks only that the line reads as words rather than symbol soup.
+function isAdBannerLine(text) {
+  const line = String(text || '').trim();
+  if (!/[a-zA-Z]{2,}/.test(line)) return false;
+  const compact = line.replace(/\s+/g, '');
+  if (compact.length < 2) return false;
+  const alphanumeric = (compact.match(/[A-Za-z0-9]/g) || []).length;
+  return alphanumeric / compact.length >= 0.55;
 }
 
 // Darkest pixel approximates the glyph, lightest its background: a single centre
@@ -471,6 +578,52 @@ export async function auditAdImage(imageSrc, brandVault, onProgress = () => {}) 
         }
       }
 
+      // 1b. Signature chromatic palette. White and black are neutrals every poster
+      // uses, so a #FFFFFF match proves nothing. A brand with a chromatic signature
+      // colour (Starbucks green) needs at least one chromatic ad colour near it.
+      const brandChromatic = brandVault.colors.filter(
+        (color) =>
+          !['#FFFFFF', '#000000'].includes(String(color.hex || '').toUpperCase()) &&
+          hslSaturation(hexToRgb(color.hex)) >= 0.18
+      );
+      const adChromatic = topRgb.filter((color) => hslSaturation(color) >= 0.18);
+
+      if (brandChromatic.length > 0 && adChromatic.length > 0) {
+        const matches = adChromatic.map((sample) => {
+          const nearest = brandChromatic
+            .map((brandColor) => ({ ...brandColor, deltaE: getDeltaE(sample, hexToRgb(brandColor.hex)) }))
+            .sort((a, b) => a.deltaE - b.deltaE)[0];
+          return { sample, nearest };
+        });
+        const closest = [...matches].sort((a, b) => a.nearest.deltaE - b.nearest.deltaE)[0];
+        const strictPalette = /no other colou?rs? may be substituted/i.test(brandVault.rawText || '');
+        const hasPaletteMatch = matches.some((match) => match.nearest.deltaE <= 38);
+        // A guideline that forbids substitution is absolute: one stray hue is a
+        // violation even when another colour in the same banner does match.
+        const strictViolation = strictPalette && matches.some((match) => match.nearest.deltaE > 40);
+        const worst = [...matches].sort((a, b) => b.nearest.deltaE - a.nearest.deltaE)[0];
+        const offender = !hasPaletteMatch ? closest : worst;
+        // Suggest the brand's strongest hue rather than whichever palette row a
+        // washed-out sample happened to pair with.
+        const signature = [...brandChromatic]
+          .sort((a, b) => hslSaturation(hexToRgb(b.hex)) - hslSaturation(hexToRgb(a.hex)))[0];
+
+        if (!hasPaletteMatch || strictViolation) {
+          visualIssues.push({
+            id: 'VIS-PALETTE-1',
+            ruleId: closest.nearest.id,
+            category: 'Visual Brand Consistency',
+            severity: 'High',
+            offendingText: `Off-Brand Visual Palette — banner hue ${offender.sample.hex}`,
+            explanation: hasPaletteMatch
+              ? `Banner hue ${offender.sample.hex} sits ΔE₇₆=${offender.nearest.deltaE} from the nearest brand colour, ${offender.nearest.name} (${offender.nearest.hex}). The guidelines state no other colours may be substituted, so a hue this far outside the palette reads as another brand's campaign.`
+              : `No chromatic colour in the banner is within ΔE₇₆=38 of the brand's signature palette. The closest is ${offender.sample.hex} at ΔE₇₆=${offender.nearest.deltaE} from ${offender.nearest.name} (${offender.nearest.hex}). These hues read as another brand's campaign.`,
+            citation: `${brandVault.sourceName}: Signature Brand Palette`,
+            suggestedFix: `Recolour the banner with the brand's chromatic palette (e.g. ${signature.hex})`
+          });
+        }
+      }
+
       // 2. Tesseract.js OCR + per-line WCAG contrast audit
       let ocrText = '';
       let ocrWordCount = 0;
@@ -497,16 +650,17 @@ export async function auditAdImage(imageSrc, brandVault, onProgress = () => {}) 
         for (const line of lines) {
           if (keptLines.length >= 12) break;
 
-          const words = (line.words || [])
+          // 55 clears the noise floor without dropping clean display type; short
+          // headlines are kept by isAdBannerLine rather than by sentence length.
+          const words = joinApostropheWords(line.words || [])
             .map((word) => ({ ...word, cleanText: cleanOcrWord(word.text) }))
-            .filter((word) => word.confidence >= 65 && OCR_WORD_PATTERN.test(word.cleanText));
+            .filter((word) => word.confidence >= 55 && OCR_WORD_PATTERN.test(word.cleanText));
           if (!words.length) continue;
 
           const lineText = words.map((word) => word.cleanText).join(' ');
           const avgConfidence = words.reduce((sum, word) => sum + word.confidence, 0) / words.length;
-          if (avgConfidence < 65) continue;
-          // Photo texture produces symbol soup; only real language reaches the audit
-          if (!isValidHumanSentence(lineText) && !isKnownOcrHeading(lineText)) continue;
+          if (avgConfidence < 55) continue;
+          if (!isAdBannerLine(lineText)) continue;
 
           keptLines.push(lineText);
           ocrWordCount += words.length;
@@ -588,7 +742,10 @@ export async function auditAdImage(imageSrc, brandVault, onProgress = () => {}) 
       }
 
       // 3. Run Full Text Audit on Text Extracted from Inside the Banner Image
-      const ocrIssues = auditAdText(ocrText, brandVault).map((iss) => ({
+      const ocrIssues = auditAdText(ocrText, brandVault, {
+        label: 'Ad creative and OCR text',
+        verb: 'contain'
+      }).map((iss) => ({
         ...iss,
         id: `OCR-${iss.id}`,
         category: `Image OCR: ${iss.category}`,

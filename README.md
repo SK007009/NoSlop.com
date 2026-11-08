@@ -29,7 +29,11 @@ and WCAG contrast math all run inside the browser tab.
 5. **Tab 4** — the **Ambiguous Guideline Auto-Refiner** now lists that rule with
    your justification; **Update Brand Rule in Vault** writes the clarification
    into the live vault. Re-run the audit and the terminology reflects it.
-6. **Tab 4** — download the **AI & Privacy Disclosure Receipt** (.JSON).
+6. **Tab 5** — type the **Authorized Signer Name**, then **Download Signed PDF
+   Certificate (.pdf)**: a formatted A4 certificate carrying the trust score,
+   workflow status, privacy attestation, remediated copy, initials stamp and a
+   real Web Crypto SHA-256 seal. The **Export Raw Audit Log (.json)** button
+   still produces the machine-readable receipt.
 
 A seeded NovaPay guideline + ad draft loads on first paint so nothing is empty.
 
@@ -364,7 +368,7 @@ citation, the offending substring, and a suggested fix per card.
    records compilation, audits, fixes, overrides, refinements, and approvals with
    timestamps and actor names.
 
-### 3.6 Test E — Tab 4: drift analytics, auto-refiner, receipt
+### 3.6 Test E — Tab 4: drift analytics & auto-refiner; Tab 5: signed certificate
 
 1. With at least one override from Test D, open **Tab 4**.
 2. **Guideline Ambiguity & Drift Analytics** shows source name, rule/fact counts,
@@ -383,10 +387,37 @@ citation, the offending substring, and a suggested fix per card.
    before you commit — retype either one, then press **Update Brand Rule in
    Vault**, and the edited wording (not the raw override text) is what lands in
    the vault.
-5. Press **Download Signed AI & Privacy Disclosure Receipt (.JSON)**. The file
-   contains `platform`, ISO `timestamp`, `guidelineSource`, `trustScore`,
-   `workflowStatus`, `disclosedEngines`, and
-   `cloudDataLeakage: "0 bytes (100% Client-Side Execution)"`.
+5. **Tab 5** — fill in **Authorized Signer Name** (defaults to
+   `Satyam (Team Kaizen)`). The circular badge picks up the initials (`ST`), and
+   the **Web Crypto SHA-256 Asset & Audit Seal** fills in with a 64-character
+   lowercase hex digest a moment later. Edit any field or switch role and the
+   digest changes: it is `crypto.subtle.digest('SHA-256', …)` over
+   `{ brandVault.sourceName, workingAdText, trustScore, activeRole, signerName }`,
+   computed in the tab, never fetched.
+6. Press **Download Signed PDF Certificate (.pdf)**. `NoSlop-Compliance-Certificate.pdf`
+   downloads immediately — one A4 page rendered at 1240 × 1754 px on an offscreen
+   canvas and wrapped in a PDF by the bundled JPEG/DCTDecode writer, so no PDF
+   package and no server are involved. It contains:
+   - **Header banner** — charcoal `#121411` with electric-lime `#D8FF4B` accents,
+     Certificate ID (`NS-` + the first ten hex characters of the digest) and the
+     ISO timestamp.
+   - **Summary box** — brand trust score, workflow status, compiled guideline
+     source, unresolved flags, approved exception overrides.
+   - **Zero-cloud attestation** — `100% On-Device Execution Verified — Zero Cloud
+     LLM Calls, Zero External API Keys, Zero Telemetry.`
+   - **Audited copy snapshot** — the remediated draft, wrapped to the page width,
+     plus every logged override with its justification, reviewer and rule.
+   - **Signature block** — `[ST]` initials stamp in a charcoal/lime seal, a script
+     signature line, `Signed by: …`, the signer's role, and the engine name; on
+     the right, the full 64-character SHA-256 digest in monospace.
+7. The secondary **Export Raw Audit Log (.json)** button writes
+   `NoSlop_Governance_Receipt.json` with `platform`, ISO `timestamp`,
+   `guidelineSource`, `trustScore`, `workflowStatus`, `unresolvedFlags`,
+   `approvedOverrides`, `signerName`, `signerRole`, `sha256AssetSeal`,
+   `auditedCopy`, `disclosedEngines`, and
+   `cloudDataLeakage: "0 bytes (100% Client-Side Execution)"`. Both artefacts are
+   produced from the same state, so the JSON is the developer-facing twin of the
+   PDF rather than a separate export path.
 
 ### 3.7 Test F — Robustness / adversarial input
 
@@ -440,7 +471,10 @@ approvers can open, mandatory written justifications for any exception override,
 a live trust score that treats overrides as accepted risk rather than hidden
 failures, an append-only revision history with actor + timestamp, and a
 downloadable JSON disclosure receipt that states — in a machine-readable file —
-which engines ran and that zero bytes left the browser.
+which engines ran and that zero bytes left the browser. Tab 5 pairs that JSON with
+a formatted, signer-named A4 PDF certificate sealed by a real Web Crypto SHA-256
+digest, so a non-technical approver can print or file the evidence without
+opening a `.json` file.
 
 **3. A closed loop from human exceptions back into the guidelines themselves.**
 This is the Round 2 headline and the reason Tab 4 exists. In Round 1 an override
@@ -502,10 +536,11 @@ out) so regex changes can be regression-tested like any other code.
 >   superlative/absolute claim gating, ALL-CAPS tone checks, canvas
 >   dominant-colour mining and palette deviation, WCAG 2.1 luminance/contrast
 >   math, and the OCR path.
-> - **`src/App.jsx`** — the entire four-tab workspace: guideline compiler UI, ad
+> - **`src/App.jsx`** — the entire five-tab workspace: guideline compiler UI, ad
 >   auditor with surgical fixes and the word-level diff, the role-gated approval
 >   workflow with comments and revision history, the drift analytics, the
->   ambiguity auto-refiner, and the privacy receipt export.
+>   ambiguity auto-refiner, and the Tab 5 signer/seal UI with its canvas-drawn
+>   A4 certificate and inline JPEG-to-PDF writer.
 > - **Verification & delivery** — production build, lint review, browser smoke
 >   tests of every tab's happy path, and this README.
 >

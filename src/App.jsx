@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { diffWords } from 'diff';
 import {
   ShieldCheck, Upload, FileText, Image as ImageIcon, CheckCircle2,
@@ -84,6 +84,440 @@ Mailchimp empowers 13 million businesses globally with a 99.9% deliverability SL
 Join 50 million businesses with a 100% deliverability guarantee and foolproof ROI!`
   }
 ];
+
+// ---------------------------------------------------------------------------
+// Tab 5 — signed PDF confidentiality certificate
+//
+// The certificate is painted onto an offscreen A4 canvas (1240 × 1754 px, ~150
+// DPI) and then wrapped in a single-page PDF by hand: one DCTDecode JPEG image
+// XObject plus a short content stream that scales it to the full MediaBox. No PDF
+// library and no server round-trip — the bytes are assembled here and handed to
+// the browser as a Blob download.
+// ---------------------------------------------------------------------------
+const CERT_WIDTH = 1240;
+const CERT_HEIGHT = 1754;
+const CERT_INK = '#121411';
+const CERT_LIME = '#D8FF4B';
+const CERT_PAPER = '#F3F4EE';
+const CERT_MUTED = '#5E6759';
+const CERT_SANS = '"Segoe UI", "Helvetica Neue", Arial, sans-serif';
+const CERT_MONO = 'Consolas, "SF Mono", "Courier New", monospace';
+const CERT_SCRIPT = '"Segoe Script", "Brush Script MT", "Lucida Handwriting", cursive';
+
+function roundRectPath(ctx, x, y, width, height, radius) {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + width - r, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+  ctx.lineTo(x + width, y + height - r);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  ctx.lineTo(x + r, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function truncateToWidth(ctx, text, maxWidth) {
+  const value = String(text ?? '');
+  if (ctx.measureText(value).width <= maxWidth) return value;
+  let cut = value;
+  while (cut.length > 1 && ctx.measureText(`${cut}…`).width > maxWidth) cut = cut.slice(0, -1);
+  return `${cut}…`;
+}
+
+// Greedy word wrap against the current font, with a hard break for single words
+// longer than the box (long URLs / hex strings) and an ellipsis once maxLines
+// is reached, so the certificate can never spill onto a second page.
+function wrapCanvasText(ctx, text, maxWidth, maxLines = Number.POSITIVE_INFINITY) {
+  const lines = [];
+  String(text ?? '')
+    .split(/\r?\n/)
+    .forEach((paragraph) => {
+      const words = paragraph.trim().split(/\s+/).filter(Boolean);
+      if (words.length === 0) {
+        lines.push('');
+        return;
+      }
+      let line = '';
+      words.forEach((word) => {
+        const candidate = line ? `${line} ${word}` : word;
+        if (ctx.measureText(candidate).width <= maxWidth) {
+          line = candidate;
+          return;
+        }
+        if (line) {
+          lines.push(line);
+          line = '';
+        }
+        if (ctx.measureText(word).width <= maxWidth) {
+          line = word;
+          return;
+        }
+        let piece = '';
+        [...word].forEach((char) => {
+          if (piece && ctx.measureText(piece + char).width > maxWidth) {
+            lines.push(piece);
+            piece = char;
+          } else {
+            piece += char;
+          }
+        });
+        line = piece;
+      });
+      if (line) lines.push(line);
+    });
+
+  if (lines.length <= maxLines) return lines;
+  const kept = lines.slice(0, maxLines);
+  kept[maxLines - 1] = truncateToWidth(ctx, `${kept[maxLines - 1]} ${lines.slice(maxLines).join(' ')}`, maxWidth);
+  return kept;
+}
+
+function renderCertificateCanvas(cert) {
+  const canvas = document.createElement('canvas');
+  canvas.width = CERT_WIDTH;
+  canvas.height = CERT_HEIGHT;
+  const ctx = canvas.getContext('2d');
+  const W = CERT_WIDTH;
+  const H = CERT_HEIGHT;
+  const margin = 56;
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(18,20,17,0.10)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(26, 26, W - 52, H - 52);
+
+  // ── Header banner ────────────────────────────────────────────────────────
+  ctx.fillStyle = CERT_INK;
+  ctx.fillRect(0, 0, W, 250);
+  ctx.fillStyle = CERT_LIME;
+  ctx.fillRect(0, 246, W, 4);
+
+  roundRectPath(ctx, margin, 46, 56, 56, 16);
+  ctx.fillStyle = CERT_LIME;
+  ctx.fill();
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 28px ${CERT_SANS}`;
+  ctx.textAlign = 'center';
+  ctx.fillText('N', margin + 28, 86);
+  ctx.textAlign = 'left';
+
+  ctx.fillStyle = CERT_LIME;
+  ctx.font = `bold 24px ${CERT_SANS}`;
+  ctx.fillText('NOSLOP.COM', margin + 76, 76);
+
+  ctx.fillStyle = '#F3F4EE';
+  ctx.font = `600 30px ${CERT_SANS}`;
+  ctx.fillText('PRE-PUBLICATION BRAND GOVERNANCE', margin + 76, 120);
+  ctx.fillText('& CONFIDENTIALITY CERTIFICATE', margin + 76, 158);
+
+  ctx.fillStyle = 'rgba(243,244,238,0.62)';
+  ctx.font = `18px ${CERT_SANS}`;
+  ctx.fillText(`Certificate ID  ${cert.certificateId}`, margin + 76, 196);
+  ctx.fillText(`Issued  ${cert.issuedAt}`, margin + 76, 224);
+
+  // ── Score & status summary ───────────────────────────────────────────────
+  const cardY = 294;
+  const cardH = 262;
+  roundRectPath(ctx, margin, cardY, W - margin * 2, cardH, 22);
+  ctx.fillStyle = CERT_PAPER;
+  ctx.fill();
+
+  const leftX = margin + 40;
+  ctx.fillStyle = CERT_MUTED;
+  ctx.font = `600 17px ${CERT_SANS}`;
+  ctx.fillText('PRE-PUBLICATION BRAND TRUST SCORE', leftX, cardY + 56);
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 96px ${CERT_SANS}`;
+  ctx.fillText(`${cert.trustScore}%`, leftX - 4, cardY + 152);
+  ctx.fillStyle = CERT_MUTED;
+  ctx.font = `17px ${CERT_SANS}`;
+  ctx.fillText(truncateToWidth(ctx, cert.workflowStatus, 320), leftX, cardY + 198);
+
+  ctx.strokeStyle = 'rgba(18,20,17,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(margin + 400, cardY + 34);
+  ctx.lineTo(margin + 400, cardY + cardH - 34);
+  ctx.stroke();
+
+  const summaryRows = [
+    ['Workflow Status', cert.workflowStatus],
+    ['Compiled Guideline Source', cert.sourceName],
+    ['Unresolved Flags', String(cert.unresolvedCount)],
+    ['Approved Exception Overrides', String(cert.overrideCount)]
+  ];
+  summaryRows.forEach(([label, value], index) => {
+    const y = cardY + 58 + index * 50;
+    ctx.fillStyle = CERT_MUTED;
+    ctx.font = `16px ${CERT_SANS}`;
+    ctx.fillText(label, margin + 440, y);
+    ctx.fillStyle = CERT_INK;
+    ctx.font = `600 20px ${CERT_SANS}`;
+    ctx.fillText(truncateToWidth(ctx, value, W - margin - 40 - (margin + 440)), margin + 440, y + 24);
+  });
+
+  // ── Zero-cloud attestation ───────────────────────────────────────────────
+  const bandY = cardY + cardH + 26;
+  const bandH = 96;
+  roundRectPath(ctx, margin, bandY, W - margin * 2, bandH, 22);
+  ctx.fillStyle = CERT_LIME;
+  ctx.fill();
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 18px ${CERT_SANS}`;
+  ctx.fillText('ZERO-CLOUD PRIVACY ATTESTATION', margin + 32, bandY + 38);
+  ctx.font = `20px ${CERT_SANS}`;
+  ctx.fillText(
+    '100% On-Device Execution Verified — Zero Cloud LLM Calls, Zero External API Keys, Zero Telemetry.',
+    margin + 32,
+    bandY + 72
+  );
+
+  // ── Audited copy snapshot ────────────────────────────────────────────────
+  const copyTitleY = bandY + bandH + 48;
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 19px ${CERT_SANS}`;
+  ctx.fillText('AUDITED COPY SNAPSHOT', margin, copyTitleY);
+
+  const copyBoxY = copyTitleY + 18;
+  const copyBoxH = 344;
+  roundRectPath(ctx, margin, copyBoxY, W - margin * 2, copyBoxH, 18);
+  ctx.fillStyle = '#FAFBF6';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(18,20,17,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `21px ${CERT_SANS}`;
+  const copyText = cert.adCopy || 'No draft copy was audited for this certificate — the audit covered artwork only.';
+  wrapCanvasText(ctx, copyText, W - margin * 2 - 64, 10).forEach((line, index) => {
+    ctx.fillText(line, margin + 32, copyBoxY + 48 + index * 28);
+  });
+
+  // ── Logged human overrides ───────────────────────────────────────────────
+  const overrideTitleY = copyBoxY + copyBoxH + 46;
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 19px ${CERT_SANS}`;
+  ctx.fillText(`LOGGED HUMAN EXCEPTION OVERRIDES (${cert.overrideCount})`, margin, overrideTitleY);
+
+  const overrideBoxY = overrideTitleY + 18;
+  const overrideBoxH = 132;
+  roundRectPath(ctx, margin, overrideBoxY, W - margin * 2, overrideBoxH, 18);
+  ctx.fillStyle = cert.overrideCount > 0 ? '#FAFBF6' : '#F7F8F2';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(18,20,17,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  if (cert.overrideCount > 0) {
+    ctx.font = `17px ${CERT_SANS}`;
+    cert.overrideEntries.slice(0, 4).forEach((entry, index) => {
+      ctx.fillStyle = CERT_INK;
+      const label = `[${entry.category || 'Exception'}] "${entry.offendingText || entry.issueId}"`;
+      ctx.fillText(truncateToWidth(ctx, label, 470), margin + 32, overrideBoxY + 38 + index * 26);
+      ctx.fillStyle = CERT_MUTED;
+      ctx.fillText(
+        truncateToWidth(ctx, `${entry.reason || 'No justification recorded'} — ${entry.actor || 'Reviewer'}`, 560),
+        margin + 520,
+        overrideBoxY + 38 + index * 26
+      );
+    });
+    if (cert.overrideCount > 4) {
+      ctx.fillStyle = CERT_MUTED;
+      ctx.fillText(`+ ${cert.overrideCount - 4} more in the JSON audit log`, margin + 32, overrideBoxY + 118);
+    }
+  } else {
+    ctx.fillStyle = CERT_MUTED;
+    ctx.font = `18px ${CERT_SANS}`;
+    ctx.fillText('None logged — every finding was resolved with a surgical fix before sign-off.', margin + 32, overrideBoxY + 74);
+  }
+
+  // ── Signature & cryptographic seal ───────────────────────────────────────
+  const sigY = 1318;
+  const sigH = 268;
+  const gap = 20;
+  const leftW = 712;
+  const rightW = W - margin * 2 - leftW - gap;
+
+  roundRectPath(ctx, margin, sigY, leftW, sigH, 20);
+  ctx.fillStyle = CERT_PAPER;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(18,20,17,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  const badgeX = margin + 76;
+  const badgeY = sigY + 76;
+  ctx.beginPath();
+  ctx.arc(badgeX, badgeY, 42, 0, Math.PI * 2);
+  ctx.fillStyle = CERT_INK;
+  ctx.fill();
+  ctx.strokeStyle = CERT_LIME;
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.fillStyle = CERT_LIME;
+  ctx.font = `bold 22px ${CERT_SANS}`;
+  ctx.textAlign = 'center';
+  ctx.fillText(`[${cert.signerInitials}]`, badgeX, badgeY + 8);
+  ctx.textAlign = 'left';
+
+  ctx.fillStyle = CERT_MUTED;
+  ctx.font = `600 15px ${CERT_SANS}`;
+  ctx.fillText('SIGNED BY', margin + 140, sigY + 56);
+  ctx.fillStyle = CERT_INK;
+  ctx.font = `bold 26px ${CERT_SANS}`;
+  ctx.fillText(truncateToWidth(ctx, cert.signerName, leftW - 172), margin + 140, sigY + 92);
+
+  ctx.fillStyle = '#243024';
+  ctx.font = `italic 40px ${CERT_SCRIPT}`;
+  const signature = cert.signerName.replace(/\s*\([^)]*\)\s*/g, ' ').trim() || cert.signerName;
+  ctx.fillText(truncateToWidth(ctx, signature, leftW - 100), margin + 44, sigY + 168);
+
+  ctx.strokeStyle = 'rgba(18,20,17,0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(margin + 40, sigY + 186);
+  ctx.lineTo(margin + leftW - 40, sigY + 186);
+  ctx.stroke();
+
+  ctx.fillStyle = CERT_MUTED;
+  ctx.font = `17px ${CERT_SANS}`;
+  ctx.fillText(truncateToWidth(ctx, `Role: ${cert.role}`, leftW - 80), margin + 40, sigY + 216);
+  ctx.fillText(
+    truncateToWidth(ctx, 'Platform: NoSlop.com On-Device Governance Engine (Team Kaizen)', leftW - 80),
+    margin + 40,
+    sigY + 244
+  );
+
+  const sealX = margin + leftW + gap;
+  roundRectPath(ctx, sealX, sigY, rightW, sigH, 20);
+  ctx.fillStyle = CERT_INK;
+  ctx.fill();
+
+  ctx.fillStyle = CERT_LIME;
+  ctx.font = `bold 14px ${CERT_SANS}`;
+  ctx.fillText('WEB CRYPTO SHA-256', sealX + 26, sigY + 44);
+  ctx.fillText('ASSET & AUDIT SEAL', sealX + 26, sigY + 66);
+
+  const digest = cert.digest || 'computing…';
+  ctx.fillStyle = '#F3F4EE';
+  ctx.font = `15px ${CERT_MONO}`;
+  const digestLines = digest.length > 32 ? [digest.slice(0, 32), digest.slice(32)] : [digest];
+  digestLines.forEach((line, index) => ctx.fillText(line, sealX + 26, sigY + 102 + index * 22));
+
+  ctx.fillStyle = 'rgba(243,244,238,0.62)';
+  ctx.font = `13px ${CERT_SANS}`;
+  wrapCanvasText(
+    ctx,
+    'SHA-256 over brand source, audited copy, trust score, signer role and signer name. Hash computed in-browser by crypto.subtle.digest — no network round-trip.',
+    rightW - 52,
+    4
+  ).forEach((line, index) => ctx.fillText(line, sealX + 26, sigY + 178 + index * 19));
+
+  // ── Footer ───────────────────────────────────────────────────────────────
+  ctx.textAlign = 'center';
+  ctx.fillStyle = CERT_MUTED;
+  ctx.font = `16px ${CERT_SANS}`;
+  ctx.fillText(
+    'Generated on-device by NoSlop.com • Team Kaizen • No document, image or draft left this browser tab.',
+    W / 2,
+    1636
+  );
+  ctx.fillStyle = 'rgba(94,103,89,0.85)';
+  ctx.font = `15px ${CERT_SANS}`;
+  ctx.fillText('Attestation covers the audit run, resolved flags and remediated copy recorded above.', W / 2, 1666);
+  ctx.textAlign = 'left';
+
+  return canvas;
+}
+
+// Minimal single-page PDF wrapper around a JPEG: Catalog → Pages → Page →
+// Image XObject (DCTDecode) + content stream, with a byte-accurate xref table.
+function buildPdfFromJpeg(jpegBytes, width, height) {
+  const encoder = new TextEncoder();
+  const parts = [];
+  const offsets = [];
+  let cursor = 0;
+
+  const write = (chunk) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : chunk;
+    parts.push(bytes);
+    cursor += bytes.length;
+  };
+  const beginObject = (id, dict) => {
+    offsets[id] = cursor;
+    write(`${id} 0 obj\n${dict}\n`);
+  };
+  const endObject = () => write('endobj\n');
+
+  // Binary comment on line 2 marks the file as containing binary data.
+  write(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a]));
+
+  beginObject(1, '<< /Type /Catalog /Pages 2 0 R >>');
+  endObject();
+  beginObject(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  endObject();
+  beginObject(
+    3,
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] ' +
+      '/Resources << /XObject << /Im0 4 0 R >> /ProcSet [/PDF /ImageC] >> /Contents 5 0 R >>'
+  );
+  endObject();
+
+  // `beginObject` appends the object's trailing newline, so these dicts end at the
+  // `stream` keyword: the declared /Length must cover exactly the bytes that
+  // follow, or a reader truncates the JPEG by one byte.
+  beginObject(
+    4,
+    `<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} ` +
+      `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBytes.length} >>\nstream`
+  );
+  write(jpegBytes);
+  write('\nendstream\n');
+  endObject();
+
+  const content = 'q\n595.28 0 0 841.89 0 0 cm\n/Im0 Do\nQ\n';
+  beginObject(5, `<< /Length ${content.length} >>\nstream`);
+  write(`${content}endstream`);
+  endObject();
+
+  const xrefOffset = cursor;
+  const objectCount = 6;
+  let xref = `xref\n0 ${objectCount}\n0000000000 65535 f \n`;
+  for (let id = 1; id < objectCount; id += 1) {
+    xref += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`;
+  }
+  write(xref);
+  write(`trailer\n<< /Size ${objectCount} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+
+  return new Blob(parts, { type: 'application/pdf' });
+}
+
+// Canvas → JPEG bytes → PDF Blob.
+function certificatePdfBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      async (blob) => {
+        if (!blob) {
+          reject(new Error('The certificate canvas could not be encoded as a JPEG.'));
+          return;
+        }
+        try {
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          resolve(buildPdfFromJpeg(bytes, canvas.width, canvas.height));
+        } catch (err) {
+          reject(err);
+        }
+      },
+      'image/jpeg',
+      0.94
+    );
+  });
+}
 
 // Banner preview with an SVG bounding-box layer over the OCR word regions
 function AdBannerWithBoxes({ src, report }) {
@@ -431,6 +865,7 @@ export default function App() {
   const [customFixes, setCustomFixes] = useState({});
   const [brandVault, setBrandVault] = useState({
     sourceName: 'None Loaded',
+    brandName: '',
     rawText: '',
     colors: [],
     bannedTerms: [],
@@ -463,6 +898,13 @@ export default function App() {
   const [revisionHistory, setRevisionHistory] = useState([]);
   const [commentInput, setCommentInput] = useState('');
   const [comments, setComments] = useState([]);
+
+  // Tab 5 — named signer plus the live Web Crypto SHA-256 seal over the artefact
+  // being certified. The digest is derived, never typed, so the value on screen
+  // can only be the hash of the fields actually shown on the certificate.
+  const [signerName, setSignerName] = useState('Satyam (Team Kaizen)');
+  const [assetSeal, setAssetSeal] = useState('');
+  const [certificateStatus, setCertificateStatus] = useState('');
 
   // Load a 1-click industry test case (guidelines + matching ad draft)
   const handleApplyPreset = (e) => {
@@ -748,6 +1190,103 @@ export default function App() {
   const hasAuditInput = workingAdText.trim().length > 0 || Boolean(imagePreview);
   const auditLocked = isExtractingAdBanner || isRunningAudit || !hasAuditInput;
   const diffs = diffWords(originalAdText, workingAdText);
+
+  // Initials stamp for the signer block: first letter of the first two words.
+  // Parentheses and punctuation are skipped so "Satyam (Team Kaizen)" stamps "ST"
+  // rather than "S(".
+  const signerInitials =
+    signerName
+      .split(/\s+/)
+      .map((word) => word.replace(/[^\p{L}]/gu, '')[0]?.toUpperCase())
+      .filter(Boolean)
+      .slice(0, 2)
+      .join('') || 'SK';
+
+  // Exactly the fields the certificate seals, in a stable order, so the digest
+  // changes whenever the brand source, copy, score, role or signer does.
+  const sealPayload = JSON.stringify({
+    brandVault: brandVault.sourceName,
+    workingAdText,
+    trustScore,
+    activeRole: role,
+    signerName
+  });
+
+  // Web Crypto only exists in a secure context (https or localhost); when it is
+  // missing the seal stays empty and no digest is ever faked.
+  const assetSealSupported = Boolean(globalThis.crypto?.subtle);
+
+  useEffect(() => {
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle) return undefined;
+    let cancelled = false;
+    subtle
+      .digest('SHA-256', new TextEncoder().encode(sealPayload))
+      .then((buffer) => {
+        if (cancelled) return;
+        setAssetSeal(
+          Array.from(new Uint8Array(buffer))
+            .map((byte) => byte.toString(16).padStart(2, '0'))
+            .join('')
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setAssetSeal('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sealPayload]);
+
+  // Paint the A4 certificate, wrap it in a PDF and hand it to the browser as a
+  // download. Nothing here touches the network: the canvas and the PDF bytes are
+  // both produced in this tab.
+  const downloadComplianceCertificatePDF = async () => {
+    const issuedAt = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+    const certificateId = `NS-${(assetSeal || 'PENDING').slice(0, 10).toUpperCase()}`;
+    const overrideEntries = Object.entries(overrides).map(([issueId, override]) => ({
+      issueId,
+      ...override
+    }));
+
+    setCertificateStatus('Rendering certificate…');
+    try {
+      const canvas = renderCertificateCanvas({
+        certificateId,
+        issuedAt,
+        trustScore,
+        workflowStatus,
+        sourceName: brandVault.sourceName,
+        unresolvedCount,
+        overrideCount: overrideEntries.length,
+        overrideEntries,
+        adCopy: workingAdText.trim(),
+        signerName: signerName.trim() || 'Unnamed Signer',
+        signerInitials,
+        role,
+        digest: assetSeal
+      });
+      const blob = await certificatePdfBlob(canvas);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'NoSlop-Compliance-Certificate.pdf';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      setCertificateStatus(`Certificate ${certificateId} downloaded (${Math.round(blob.size / 1024)} KB).`);
+      setRevisionHistory((prev) => [
+        {
+          time: new Date().toLocaleTimeString(),
+          actor: role,
+          action: `Issued signed PDF certificate ${certificateId} — signed by ${signerName || 'Unnamed Signer'}, SHA-256 ${(assetSeal || 'pending').slice(0, 12)}…`
+        },
+        ...prev
+      ]);
+    } catch (err) {
+      console.warn('Certificate generation failed:', err);
+      setCertificateStatus('Could not build the PDF in this browser — try the JSON export.');
+    }
+  };
 
   // Resolve an override's ruleId back to the live rule held in the Brand Vault
   const findVaultRule = (ruleId) =>
@@ -1799,7 +2338,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 5: CONFIDENTIALITY & AI DISCLOSURE RECEIPT */}
+        {/* TAB 5: CONFIDENTIALITY & BRAND GOVERNANCE CERTIFICATE */}
         {activeTab === 'receipt' && (
           <div className="max-w-2xl w-full mx-auto">
             <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-8 space-y-5 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
@@ -1807,7 +2346,10 @@ export default function App() {
                 <div className="w-10 h-10 rounded-full bg-[#121510] text-[#D8FF4B] flex items-center justify-center">
                   <Lock className="w-4 h-4" />
                 </div>
-                <h2 className="font-semibold text-lg tracking-tight">Confidentiality & AI Disclosure Receipt</h2>
+                <h2 className="font-semibold text-lg tracking-tight">Confidentiality & Brand Governance Certificate</h2>
+                <p className="max-w-md text-[11px] text-[#5E6759]">
+                  Sign it, seal it with a real SHA-256 fingerprint and download a formatted A4 PDF for legal or client records — no JSON reading required.
+                </p>
               </div>
               <p className="text-xs text-[#2B3129] leading-relaxed">
                 All document parsing (`pdfjs-dist`), OCR (`tesseract.js`), NLP claim extraction (`compromise` + `fuse.js`), and WCAG contrast math execute 100% locally inside the browser. Zero confidential drafts or assets are transmitted to external cloud LLM APIs.
@@ -1832,28 +2374,96 @@ export default function App() {
                   </strong>
                 </div>
               </div>
-              <button
-                onClick={() => {
-                  const receipt = {
-                    platform: 'NoSlop.com by Team Kaizen (Satyam)',
-                    timestamp: new Date().toISOString(),
-                    guidelineSource: brandVault.sourceName,
-                    trustScore,
-                    workflowStatus,
-                    disclosedEngines: ['pdfjs-dist', 'tesseract.js WASM', 'compromise NLP', 'fuse.js', 'HTML5 Canvas WCAG 2.1'],
-                    cloudDataLeakage: '0 bytes (100% Client-Side Execution)'
-                  };
-                  const blob = new Blob([JSON.stringify(receipt, null, 2)], { type: 'application/json' });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = 'NoSlop_Governance_Receipt.json';
-                  a.click();
-                }}
-                className="w-full py-3 rounded-full bg-[#121411] hover:bg-[#22261f] text-xs font-semibold text-[#D8FF4B] cursor-pointer"
-              >
-                Download Signed AI & Privacy Disclosure Receipt (.JSON)
-              </button>
+
+              {/* Signer identity + live cryptographic seal */}
+              <div className="rounded-[24px] bg-[#E7E9E0] border border-black/10 p-4 space-y-4">
+                <div className="flex items-center gap-3">
+                  <span className="w-11 h-11 shrink-0 rounded-full bg-[#121411] text-[#D8FF4B] border-2 border-[#D8FF4B] flex items-center justify-center text-[11px] font-bold">
+                    [{signerInitials}]
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <label
+                      htmlFor="certificate-signer"
+                      className="block text-[11px] font-semibold uppercase tracking-wider text-[#5E6759]"
+                    >
+                      Authorized Signer Name
+                    </label>
+                    <input
+                      id="certificate-signer"
+                      value={signerName}
+                      onChange={(e) => setSignerName(e.target.value)}
+                      placeholder="Name printed on the certificate"
+                      className="mt-1 w-full rounded-xl bg-white border border-black/10 px-3 py-2 text-sm font-semibold text-[#141712] focus:border-[#121411] focus:outline-none"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-[#5E6759]">
+                      Web Crypto SHA-256 Asset & Audit Seal
+                    </span>
+                    <span
+                      className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                        assetSeal ? 'bg-[#121411] text-[#D8FF4B]' : 'bg-black/10 text-[#5E6759]'
+                      }`}
+                    >
+                      {assetSeal ? 'VERIFIED' : assetSealSupported ? 'COMPUTING…' : 'UNAVAILABLE'}
+                    </span>
+                  </div>
+                  <code className="mt-1.5 block break-all rounded-xl bg-[#121411] text-[#D8FF4B] px-3 py-2 font-mono text-[10px] leading-relaxed">
+                    {assetSeal || '·'.repeat(64)}
+                  </code>
+                  <p className="mt-1.5 text-[10px] text-[#5E6759]">
+                    SHA-256 of brand source, audited copy, trust score, active role and signer name — recomputed in this tab on every edit.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-3">
+                <button
+                  onClick={downloadComplianceCertificatePDF}
+                  className="flex-1 py-3 rounded-full bg-[#121411] hover:bg-[#22261f] text-xs font-semibold text-[#D8FF4B] cursor-pointer"
+                >
+                  Download Signed PDF Certificate (.pdf)
+                </button>
+                <button
+                  onClick={() => {
+                    const receipt = {
+                      platform: 'NoSlop.com by Team Kaizen (Satyam)',
+                      timestamp: new Date().toISOString(),
+                      guidelineSource: brandVault.sourceName,
+                      trustScore,
+                      workflowStatus,
+                      unresolvedFlags: unresolvedCount,
+                      approvedOverrides: Object.entries(overrides).map(([issueId, override]) => ({
+                        issueId,
+                        ...override
+                      })),
+                      signerName,
+                      signerRole: role,
+                      sha256AssetSeal: assetSeal,
+                      auditedCopy: workingAdText,
+                      disclosedEngines: ['pdfjs-dist', 'tesseract.js WASM', 'compromise NLP', 'fuse.js', 'HTML5 Canvas WCAG 2.1', 'Web Crypto SHA-256'],
+                      cloudDataLeakage: '0 bytes (100% Client-Side Execution)'
+                    };
+                    const blob = new Blob([JSON.stringify(receipt, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'NoSlop_Governance_Receipt.json';
+                    a.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+                  }}
+                  className="py-3 px-5 rounded-full bg-[#E7E9E0] border border-black/10 hover:bg-white text-xs font-semibold text-[#121411] cursor-pointer whitespace-nowrap"
+                >
+                  Export Raw Audit Log (.json)
+                </button>
+              </div>
+              {certificateStatus && (
+                <p className="text-[11px] text-center text-[#5E6759]" role="status">
+                  {certificateStatus}
+                </p>
+              )}
             </div>
           </div>
         )}

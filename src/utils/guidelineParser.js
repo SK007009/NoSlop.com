@@ -20,10 +20,13 @@ try {
 // pages: the ones that print colour specs, plus the scanned ones with no text layer.
 const MAX_TEXT_PAGES = 40;
 const MAX_VISUAL_PAGES = 5;
-const MAX_OCR_PAGES = 3;
+const MAX_OCR_PAGES = 15;
 const PDF_RENDER_SCALE = 1.5;
+// A scanned page is a photograph of text: at 1.5× Tesseract drops thin glyphs and
+// curly apostrophes, so OCR pages render larger than palette-only pages.
+const OCR_RENDER_SCALE = 1.75;
 // Below this many selectable characters a page is treated as scanned artwork
-const SPARSE_PAGE_TEXT = 40;
+const SPARSE_PAGE_TEXT = 60;
 // Text items sitting within this many PDF units share a baseline
 const LINE_JUMP = 3;
 const MAX_SAMPLED_COLORS = 8;
@@ -37,6 +40,20 @@ function channelHex(value) {
 
 function rgbToHex(r, g, b) {
   return `#${channelHex(r)}${channelHex(g)}${channelHex(b)}`.toUpperCase();
+}
+
+// HSL saturation/lightness of a raw RGB triple. Used to tell a printed brand hue
+// apart from a neutral grey calibration bar or the page's own white margin.
+function hslOf(r, g, b) {
+  const max = Math.max(r, g, b) / 255;
+  const min = Math.min(r, g, b) / 255;
+  const lightness = (max + min) / 2;
+  const delta = max - min;
+  if (delta === 0) return { s: 0, l: lightness };
+  return {
+    s: delta / (1 - Math.abs(2 * lightness - 1)),
+    l: lightness
+  };
 }
 
 // Readable swatch names, so a sampled palette is not four rows of "Custom Color"
@@ -129,12 +146,12 @@ function loadImage(src) {
   });
 }
 
-// One throwaway worker per OCR pass: terminating keeps a WASM worker from being
-// held open for the rest of the session after a single scanned page.
-async function runOcr(source) {
-  let worker = null;
+// A caller may pass a shared worker so a multi-page scan loads the WASM engine and
+// language data once. A throwaway worker (no shared worker) is still terminated.
+async function runOcr(source, sharedWorker = null) {
+  let worker = sharedWorker;
   try {
-    worker = await Tesseract.createWorker('eng');
+    if (!worker) worker = await Tesseract.createWorker('eng');
     // Block geometry carries per-line confidence, which is the only way to tell a
     // real caption from photo-collage noise like "aud -7 EEE s".
     let timer = null;
@@ -164,7 +181,7 @@ async function runOcr(source) {
     // keep the line only when it averages 65+ confidence and reads as language.
     return lines
       .map((line) =>
-        (line.words || [])
+        joinApostropheWords(line.words || [])
           .map((word) => ({ text: cleanOcrWord(word.text), confidence: word.confidence }))
           .filter((word) => word.confidence >= OCR_MIN_WORD_CONFIDENCE && OCR_WORD_PATTERN.test(word.text))
       )
@@ -184,7 +201,7 @@ async function runOcr(source) {
     console.warn('Guideline OCR warning:', err);
     return '';
   } finally {
-    if (worker) {
+    if (worker && !sharedWorker) {
       try {
         await worker.terminate();
       } catch {
@@ -230,8 +247,11 @@ export function extractColorsFromCanvas(canvas, maxColors = 4, sourceLabel = 'Vi
     const r = pixels[i];
     const g = pixels[i + 1];
     const b = pixels[i + 2];
-    if (r > 240 && g > 240 && b > 240) continue;
-    if (r < 18 && g < 18 && b < 18) continue;
+    // Page white, print black and every achromatic calibration bar are neutral:
+    // sampling them used to push a grey #E0E0E0/#A0A0A0/#B0B0B0 ramp into the
+    // palette and bury the brand's actual green.
+    const { s, l } = hslOf(r, g, b);
+    if (s < 0.15 || l > 0.88 || l < 0.12) continue;
 
     const qr = Math.min(255, Math.round(r / 16) * 16);
     const qg = Math.min(255, Math.round(g / 16) * 16);
@@ -297,7 +317,9 @@ export async function extractTextFromPDF(file, onProgress = () => {}) {
     .map((page) => page.number);
 
   const visualPages = new Set([...coverPages, ...palettePages]);
-  // Only genuinely scanned pages are worth an OCR run, and never more than three
+  // Scanned decks put whole rule sections on their later pages (discounting on page
+  // 8, logo misuse on page 5), so every text-free page is OCR'd, not just the first
+  // three. MAX_OCR_PAGES only exists to bound a pathological 200-page scan.
   const ocrPages = new Set(
     parsedPages
       .filter((page) => page.text.length < SPARSE_PAGE_TEXT)
@@ -309,51 +331,72 @@ export async function extractTextFromPDF(file, onProgress = () => {}) {
   const seenHex = new Set();
   const pagesToRender = [...new Set([...visualPages, ...ocrPages])].sort((a, b) => a - b);
 
-  for (let index = 0; index < pagesToRender.length; index += 1) {
-    const pageNumber = pagesToRender[index];
-    const isVisual = visualPages.has(pageNumber);
-    const needsOcr = ocrPages.has(pageNumber);
-    const work = isVisual && needsOcr ? 'palette + OCR' : isVisual ? 'palette sampling' : 'scanned page OCR';
+  // One worker for the whole document: createWorker loads the WASM engine and the
+  // English model (seconds of work), so a worker per page made an 8-page scan feel
+  // like a hang.
+  let ocrWorker = null;
+  const getOcrWorker = async () => {
+    if (!ocrWorker) ocrWorker = await Tesseract.createWorker('eng');
+    return ocrWorker;
+  };
 
-    onProgress(
-      45 + Math.round((index / Math.max(1, pagesToRender.length)) * 50),
-      `Rendering page ${pageNumber} of ${pdf.numPages} — ${work}…`
-    );
+  try {
+    for (let index = 0; index < pagesToRender.length; index += 1) {
+      const pageNumber = pagesToRender[index];
+      const isVisual = visualPages.has(pageNumber);
+      const needsOcr = ocrPages.has(pageNumber);
+      const work = isVisual && needsOcr ? 'palette + OCR' : isVisual ? 'palette sampling' : 'scanned page OCR';
 
-    const page = await pdf.getPage(pageNumber);
-    // Fresh canvas per page: reusing one would paint page 2 over page 1's artwork
-    // and sample a blend of both.
-    const viewport = page.getViewport({ scale: PDF_RENDER_SCALE });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.floor(viewport.width));
-    canvas.height = Math.max(1, Math.floor(viewport.height));
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-
-    if (isVisual) {
-      extractColorsFromCanvas(canvas, 3, `${file.name} (Page ${pageNumber} Palette)`).forEach((color) => {
-        if (seenHex.has(color.hex) || visualColors.length >= MAX_SAMPLED_COLORS) return;
-        seenHex.add(color.hex);
-        visualColors.push(color);
-      });
-    }
-
-    if (needsOcr) {
       onProgress(
-        45 + Math.round(((index + 0.5) / Math.max(1, pagesToRender.length)) * 50),
-        `Page ${pageNumber} has no text layer — running OCR…`
+        45 + Math.round((index / Math.max(1, pagesToRender.length)) * 50),
+        `Rendering page ${pageNumber} of ${pdf.numPages} — ${work}…`
       );
-      const ocrText = await runOcr(canvas);
-      if (ocrText) {
-        pageTexts.set(pageNumber, `${pageTexts.get(pageNumber) || ''} ${ocrText}`.trim());
+
+      const page = await pdf.getPage(pageNumber);
+      // Fresh canvas per page: reusing one would paint page 2 over page 1's artwork
+      // and sample a blend of both.
+      const viewport = page.getViewport({
+        scale: needsOcr ? Math.max(PDF_RENDER_SCALE, OCR_RENDER_SCALE) : PDF_RENDER_SCALE
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+
+      if (isVisual) {
+        extractColorsFromCanvas(canvas, 3, `${file.name} (Page ${pageNumber} Palette)`).forEach((color) => {
+          if (seenHex.has(color.hex) || visualColors.length >= MAX_SAMPLED_COLORS) return;
+          seenHex.add(color.hex);
+          visualColors.push(color);
+        });
+      }
+
+      if (needsOcr) {
+        onProgress(
+          45 + Math.round(((index + 0.5) / Math.max(1, pagesToRender.length)) * 50),
+          `Running OCR on scanned PDF page ${pageNumber} of ${pdf.numPages}...`
+        );
+        const ocrText = await runOcr(canvas, await getOcrWorker());
+        if (ocrText) {
+          pageTexts.set(pageNumber, `${pageTexts.get(pageNumber) || ''} ${ocrText}`.trim());
+        }
+      }
+
+      // Release the bitmap before the next page renders
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  } finally {
+    if (ocrWorker) {
+      try {
+        await ocrWorker.terminate();
+      } catch {
+        /* worker already released */
       }
     }
-
-    // Release the bitmap before the next page renders
-    canvas.width = 0;
-    canvas.height = 0;
   }
 
   const fullText = parsedPages
@@ -447,10 +490,26 @@ function extractColorSwatches(rawText, sourceName) {
     push(rgbToHex(Number(match[1]), Number(match[2]), Number(match[3])), `${sourceName} (Auto-mined RGB)`);
   }
 
+  // Printed swatch tables read "R0 G112 B74". OCR turns the zero of RO into the
+  // letter O and the B of B74 into an 8, so both are repaired before the maths:
+  // "RO G112 874" is still #00704A.
+  const channelValue = (token) => Number(String(token).replace(/[OoQ]/g, '0')) || 0;
+  // Printed swatch tables drop the '#': a standalone six-character code under an
+  // HTML/HEX column (00704A, 000000) is still a brand colour. A code with no digit
+  // is far more likely a word ("COFFEE"), so those are not promoted.
+  for (const match of rawText.matchAll(/(?:^|[\s|(])([0-9A-Fa-f]{6})(?=$|[\s|),])/gm)) {
+    const token = match[1];
+    if (!/\d/.test(token) || /^[A-Z][a-z]/.test(token)) continue;
+    push(`#${token}`, `${sourceName} (HTML Hex Table)`);
+  }
+
   for (const match of rawText.matchAll(
-    /\bR\s*[:=]?\s*(\d{1,3})\b[\s,;|/]*\bG\s*[:=]?\s*(\d{1,3})\b[\s,;|/]*\bB\s*[:=]?\s*(\d{1,3})\b/g
+    /\bR\s*[:=]?\s*([0-9OoQ]{1,3})\b[^\w%]{0,3}\bG\s*[:=]?\s*([0-9OoQ]{1,3})\b[^\w%]{0,3}\b(?:B|8)\s*[:=]?\s*(\d{1,3})\b/g
   )) {
-    push(rgbToHex(Number(match[1]), Number(match[2]), Number(match[3])), `${sourceName} (Auto-mined RGB)`);
+    push(
+      rgbToHex(channelValue(match[1]), channelValue(match[2]), channelValue(match[3])),
+      `${sourceName} (Auto-mined RGB)`
+    );
   }
 
   return swatches;
@@ -476,6 +535,12 @@ const COLOR_SECTION_HEADING = /^(?:brand colou?rs?|accent colou?rs?|primary colo
 const FONT_SECTION_HEADING = /^(?:brand fonts?|fonts?|typefaces?|typography|headings?|subheadings?|body(?: copy| text)?)\b/i;
 const LOGO_SECTION_HEADING = /^(?:logo|wordmark|lockup)\b/i;
 const GENERIC_SECTION_WORD = /(?:keywords?|colou?rs?|fonts?|typography|logo|wordmark|mission|purpose|vision|values|description|overview|guidelines?|rules?|tone|voice|do|don['’]?ts?|avoid|banned|prohibited|negative|positive)/i;
+// Rule sections that live in bullets rather than sentences. A label like "Logo
+// Improper Use" says nothing on its own; every item underneath it is the rule.
+const RESTRICTION_SECTION_HEADING = /(discounting guidelines|prohibited from being used in|logo improper use|co-branding requirements)/i;
+// When a deck forbids discounting, these are the hooks an ad can actually trip.
+const DISCOUNT_TRIGGER_TERMS = ['discount', '% off', 'percent-off', 'cents-off', 'free', 'complimentary', 'BOGO', 'coupon', 'bundle'];
+const LAYOUT_SPEC_PATTERN = /smaller than|larger than|clear space|minimum size|wordmark|siren symbol|pantone|cmyk|uncoated stock| coated hue|black value|gray scale|ink density|registration marks/i;
 const PROSE_SECTION_HEADINGS = [
   [/^mission\b/i, 'mission'],
   [/^purpose\b/i, 'purpose'],
@@ -500,8 +565,14 @@ function detectSectionHeading(line, current) {
   if (!text) return null;
 
   const words = text.split(/\s+/).filter(Boolean);
-  const isShort = text.length <= 48 && words.length <= 6;
+  // "wordmark." is a sentence fragment from mid-paragraph, not a heading. Without
+  // the punctuation guard it ended the rule section and swallowed the bullets.
+  const isShort = text.length <= 48 && words.length <= 6 && !/[.,;]$/.test(text);
   const isAllCaps = isShort && !/[a-z]/.test(text) && /[A-Z]{3}/.test(text);
+
+  // "HTML / HEX / R G B" and "Color Print Specifications" head swatch tables even
+  // when OCR merges the header with the first row into a long line.
+  if (/^(?:html|hex|rgb|colou?r)\b/i.test(text) && text.length <= 70) return 'colors';
 
   if (isShort) {
     if (NEGATIVE_SECTION_HEADING.test(text)) return 'negative';
@@ -619,13 +690,35 @@ export function isValidHumanSentence(str) {
   return nonSpace > 0 && letters / nonSpace >= 0.65;
 }
 
-const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'-]{2,}$/;
+// Curly apostrophes and quotes come straight out of Tesseract/PDF text, and brand
+// copy is full of ®, & and decimal inches (".5\""): none of those may drop a word.
+const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'’‘"“”&®-]{2,}$/;
 
 function cleanOcrWord(text) {
   return String(text || '')
     .trim()
-    .replace(/^[^a-zA-Z0-9]+/, '')
-    .replace(/[^a-zA-Z0-9%$.,'-]+$/, '');
+    .replace(/^[^a-zA-Z0-9.]+/, '')
+    .replace(/[^a-zA-Z0-9%$.,'’‘"“”&®-]+$/, '');
+}
+
+// Tesseract often emits the apostrophe of "CAN’T" as its own token, or splits the
+// final T off after it. Re-joining keeps the word whole instead of dropping it.
+function joinApostropheWords(words) {
+  const joined = [];
+  for (const word of words) {
+    const text = String(word.text || '').trim();
+    const previous = joined[joined.length - 1];
+    if (previous && /^['’‘`´]+$/.test(text) && /[A-Za-z]$/.test(previous.text)) {
+      previous.text += text;
+      continue;
+    }
+    if (previous && /['’‘`´]$/.test(previous.text) && /^[A-Za-z]$/.test(text)) {
+      previous.text += text;
+      continue;
+    }
+    joined.push({ ...word, text });
+  }
+  return joined;
 }
 
 // Structure that legitimately falls below sentence length: section headings,
@@ -645,14 +738,62 @@ function isKnownOcrHeading(line) {
   return allCaps || keywordRow;
 }
 
+// Brand names are almost always the first non-generic word of the file name:
+// "starbucks brand guidelines.pdf" -> Starbucks, "Nike_Guidelines_2026.pdf" -> Nike.
+const BRAND_NAME_NOISE = /^(?:the|brand|brands|guidelines?|standards?|communications?|content|style|guide|books?|identity|visual|partner|partners|copy|final|logo|pdf|doc|docx|2026|20\d\d)$/i;
+
+function inferBrandName(rawText, sourceName = '') {
+  const base = String(sourceName || '')
+    .replace(/\.[a-z0-9]{2,5}$/i, '')
+    .replace(/[_+]+/g, ' ');
+  const words = base
+    .split(/[^A-Za-z0-9&'’.-]+/)
+    .filter((word) => word && !BRAND_NAME_NOISE.test(word) && !/^\d/.test(word));
+  if (words.length) {
+    return words[0].replace(/^[-.]+|[-.]+$/g, '').replace(/\b[a-z]/g, (c) => c.toUpperCase());
+  }
+
+  const firstLine = (String(rawText || '').split('\n').find((line) => line.trim().length > 3) || '')
+    .replace(/\[Page \d+\]/, '')
+    .trim();
+  const capitalised = firstLine.split(/\s+/).find((word) => /^[A-Z][a-z]{2,}/.test(word));
+  return capitalised ? capitalised.replace(/[^A-Za-z'’-]/g, '') : '';
+}
+
 export function parseRawGuidelines(rawText, sourceName = 'Uploaded Brand Guideline', visualColors = []) {
   // Brand books write rules as sentences, but splitting on every period sliced
   // decimals ("5.33 oz") and abbreviations in half. A break now needs a real
   // newline or a capitalised new sentence.
-  const lines = rawText
+  const wrappedLines = rawText
     .split(/(?:\r?\n|(?<=[.!?])\s+(?=[A-Z"'“”]))/)
     .map((l) => l.trim())
     .filter((l) => l.length > 3);
+
+  // 0. Narrow print columns wrap mid-sentence: "while the word Starbucks in the WPS
+  // wordmark" / "should be no smaller than .5\" (13mm) height." A lowercase
+  // continuation belongs to the line above unless that line already closed itself.
+  const isListLine = (text) => /^(?:[-–—•·*]|\d+[.)])\s+/.test(text);
+  const isHeadingLine = (text) => {
+    // The page tag is a prefix on the heading, not part of it: "[Page 8] Discounting
+    // Guidelines" is still a title, so the bullet beneath it must not be swallowed.
+    const bare = text.replace(/^\[Page \d+\]\s*/, '');
+    return /^[A-Z]/.test(bare) && bare.split(/\s+/).length <= 6 && !/[.,;]$/.test(bare);
+  };
+
+  const lines = [];
+  wrappedLines.forEach((line) => {
+    const previous = lines[lines.length - 1];
+    // A bullet under a heading, or a line under a short title, is a new item — not
+    // a wrapped continuation of that heading.
+    const canContinue =
+      previous && !isListLine(line) && !isHeadingLine(previous) && !/[.!?:]$/.test(previous);
+    if (previous && /^[a-z]/.test(line) && canContinue) {
+      lines[lines.length - 1] = `${previous} ${line}`;
+    } else {
+      lines.push(line);
+    }
+  });
+  const brandName = inferBrandName(rawText, sourceName);
 
   // 1. Written colour values (#HEX, rgb(), R/G/B) and the palette rows that lost
   // their "#" in OCR. Sampled artwork colours join them after the line pass.
@@ -665,15 +806,32 @@ export function parseRawGuidelines(rawText, sourceName = 'Uploaded Brand Guideli
   // Brand decks list their rules under headings instead of writing "Never use..."
   // sentences, so the heading a line sits beneath decides how that line is read.
   let currentSection = 'neutral';
+  let restrictionKind = '';
 
   lines.forEach((line, idx) => {
     const pageTag = line.match(/\[Page (\d+)\]/);
-    if (pageTag) currentPage = `Page ${pageTag[1]}`;
+    if (pageTag) {
+      currentPage = `Page ${pageTag[1]}`;
+      // A bullet block belongs to its own page, not to whatever follows the break
+      if (currentSection === 'restriction') currentSection = 'neutral';
+    }
     const cleanLine = line.replace(/\[Page \d+\]\s*/, '').trim();
     if (!cleanLine) return;
 
     const bulletText = cleanLine.replace(/^(?:[-–—•·*]+|\d+[.)])\s*/, '').trim();
     if (!bulletText) return;
+
+    // "Discounting Guidelines" and "Logo Improper Use" are headings over bullet
+    // lists, and the list is the rule. Checked before the generic heading pass, which
+    // would otherwise file "Logo Improper Use" away as a skipped logo section.
+    const restrictionHeading = cleanLine.length <= 80 && cleanLine.match(RESTRICTION_SECTION_HEADING);
+    if (restrictionHeading) {
+      currentSection = 'restriction';
+      restrictionKind = /discount|coupon|promotion|cents-off|percent-off|free|bundl|offer/i.test(cleanLine)
+        ? 'discounting'
+        : 'other';
+      return;
+    }
 
     // A heading decides how everything beneath it reads: a Negative Keywords block
     // is a rule even though no line in it says "never use".
@@ -708,16 +866,52 @@ export function parseRawGuidelines(rawText, sourceName = 'Uploaded Brand Guideli
     if (currentSection === 'fonts' || currentSection === 'logo') return;
 
     const citation = `${sourceName} (${currentPage}): "${cleanLine.slice(0, 95)}"`;
-    const pushRule = (term, replacement, reason) => {
+    const pushRule = (term, replacement, reason, citationOverride) => {
       if (!term) return;
       bannedTerms.push({
         id: `RULE-T${bannedTerms.length + 1}`,
         term,
         replacement,
         reason,
-        citation
+        citation: citationOverride || citation
       });
     };
+
+    // 1b. Bullets and numbered directives under a restriction heading. A discounting
+    // ban is worth little if the only captured rule is the heading, so the concrete
+    // promotional hooks and every quoted example are indexed as terms with a
+    // citation that points at the section a reviewer can verify.
+    if (currentSection === 'restriction') {
+      const item = bulletText.replace(/\s+/g, ' ').trim();
+      if (!item) return;
+      const quoted = [...cleanLine.matchAll(/["'“”]([^"'“”]{2,48})["'“”]/g)].map((m) => m[1].trim());
+
+      if (restrictionKind === 'discounting') {
+        const discountCitation = `Discounting Guidelines (${currentPage}): "${cleanLine.slice(0, 95)}"`;
+        DISCOUNT_TRIGGER_TERMS.forEach((term) =>
+          pushRule(
+            term,
+            null,
+            'Discounting, coupons and free offers are prohibited by the brand guidelines',
+            discountCitation
+          )
+        );
+        quoted.forEach((example) =>
+          pushRule(example, null, 'Quoted example of a prohibited discount promotion', discountCitation)
+        );
+        if (item.length <= 90) {
+          pushRule(item, null, 'Prohibited discounting practice', discountCitation);
+        }
+        return;
+      }
+
+      // Logo misuse: "1. Do not stretch or distort the logo" is a real directive
+      const isDirective = /^(?:do not|don['’]t|never|no\b|avoid|must not|not\b)/i.test(item);
+      if (isDirective && item.length <= 120) {
+        pushRule(item, null, 'Prohibited logo usage listed in the brand guidelines');
+      }
+      return;
+    }
 
     // 2. Reverse-order directive: "Use "email campaign" instead of "e-mail blast"."
     const reverseSwap = cleanLine.match(
@@ -788,8 +982,14 @@ export function parseRawGuidelines(rawText, sourceName = 'Uploaded Brand Guideli
     const alphaRich = hasAlphaWordRun(cleanLine);
     const proseSentence = isProseSentence(cleanLine, inProseSection);
 
+    // Logo sizing, clear-space and print-spec sentences are production instructions,
+    // not brand claims: indexing them gave the fact ledger "wordmark no smaller than
+    // .5\"" as if it were a verifiable metric.
+    const isLayoutSpec = LAYOUT_SPEC_PATTERN.test(cleanLine) || /^[a-z]/.test(cleanLine);
+
     if (
       !isProhibitive &&
+      !isLayoutSpec &&
       !swapMatch &&
       !reverseSwap &&
       isValidHumanSentence(cleanLine) &&
@@ -871,6 +1071,7 @@ export function parseRawGuidelines(rawText, sourceName = 'Uploaded Brand Guideli
 
   return {
     sourceName,
+    brandName,
     rawText,
     colors: colors.length > 0 ? colors : [
       { id: 'CLR-1', name: 'Primary Brand Blue', hex: '#2563EB', source: 'Default Palette (Add #HEX in guideline)' },

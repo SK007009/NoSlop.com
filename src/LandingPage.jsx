@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { ArrowRight, Play, ShieldCheck } from 'lucide-react';
 
-// Mock ad queue. The four creatives live in public/ads/; if one is missing the
-// card falls back to a panel painted in the ad's own theme colour.
+// Mock ad queue, in playback order: Starbucks → Spotify → Nike → McDonald's →
+// Apple → Tesla. The creatives live in public/ads/; if one is missing the card
+// falls back to a panel painted in the ad's own theme colour.
 const MOCK_ADS = [
   {
     id: 'starbucks',
@@ -10,16 +11,25 @@ const MOCK_ADS = [
     title: 'Iced latte, spilled cold.',
     imageUrl: '/ads/starbucks%20ad.jpg',
     themeColor: '#4E8F86',
-    // Used when the canvas sample is blocked (tainted canvas / missing asset)
-    fallbackLuminance: 0.62
+    // Fallbacks used when the canvas sample is blocked (tainted canvas / missing
+    // asset). `focus` is the brightest area of the creative — the whipped cream
+    // and milk splash — used only if the frame itself is dark.
+    fallbackLuminance: 0.62,
+    focusLuminance: 0.78,
+    focus: { x: 0.5, y: 0.66 }
   },
   {
-    id: 'mcdonalds',
-    brand: "McDonald's",
-    title: 'Get ready to burn your tongue.',
-    imageUrl: '/ads/mcd%20add2%20.jpeg',
-    themeColor: '#E4002B',
-    fallbackLuminance: 0.32
+    id: 'spotify',
+    brand: 'Spotify',
+    title: '20 million people already love Premium.',
+    imageUrl: '/ads/spotify.jpg',
+    themeColor: '#E23A7F',
+    // Pink frame with white type/shapes; the measured frame average sits just
+    // above the brightness threshold, so it keeps its full-frame framing. The
+    // fallback matches that so there is no crop flash before the sample lands.
+    fallbackLuminance: 0.49,
+    focusLuminance: 0.9,
+    focus: { x: 0.2, y: 0.86 }
   },
   {
     id: 'nike',
@@ -27,7 +37,32 @@ const MOCK_ADS = [
     title: 'They keep you alive.',
     imageUrl: '/ads/nike%20add2.jpeg',
     themeColor: '#8A93A0',
-    fallbackLuminance: 0.88
+    fallbackLuminance: 0.88,
+    focusLuminance: 0.94,
+    focus: { x: 0.14, y: 0.12 }
+  },
+  {
+    id: 'mcdonalds',
+    brand: "McDonald's",
+    title: 'Get ready to burn your tongue.',
+    imageUrl: '/ads/mcd%20add2%20.jpeg',
+    themeColor: '#E4002B',
+    fallbackLuminance: 0.32,
+    // The frame is saturated red; the lit fries carton is the only bright region.
+    focusLuminance: 0.7,
+    focus: { x: 0.5, y: 0.32 }
+  },
+  {
+    id: 'apple',
+    brand: 'Apple',
+    title: 'Every finish. One iPhone.',
+    // The file is AVIF despite the .jpeg extension; every current browser decodes
+    // it, and the canvas sampler reads it like any other creative.
+    imageUrl: '/ads/apple.jpeg',
+    themeColor: '#B9BCC0',
+    fallbackLuminance: 0.85,
+    focusLuminance: 0.96,
+    focus: { x: 0.5, y: 0.5 }
   },
   {
     id: 'tesla',
@@ -35,12 +70,19 @@ const MOCK_ADS = [
     title: 'Waiting for fuel? We don\u2019t do that over here.',
     imageUrl: '/ads/tesla%20ad2.jpeg',
     themeColor: '#C63A20',
-    fallbackLuminance: 0.38
+    fallbackLuminance: 0.38,
+    // Red frame with a white Model X at the centre.
+    focusLuminance: 0.82,
+    focus: { x: 0.5, y: 0.42 }
   }
 ];
 
 const STATUS_DURATION = 5000;
 const BRIGHT_THRESHOLD = 0.48;
+// The blurred backdrop is a zoomed crop centred on the creative's brightest area
+// rather than the whole frame, so a saturated ad still lights up the text column.
+const BACKDROP_ZOOM = 1.8;
+const BACKDROP_FOCUS = { x: 0.32, y: 0.48 };
 
 const NAV_LINKS = [
   { label: 'Product', tab: 'product' },
@@ -48,29 +90,64 @@ const NAV_LINKS = [
   { label: 'Trust', tab: 'receipt' }
 ];
 
-// Average relative luminance of an image, sampled on a 16x16 canvas.
-// Returns null when the canvas cannot be read (CORS / decode failure), so the
-// caller can fall back to the per-ad hand-tuned value.
-function sampleLuminance(src) {
+// Relative luminance of an image sampled on a 24x24 grid. The brightest 5x5
+// neighbourhood (not a single specular pixel) wins, and its centre gives the
+// point the backdrop crop should be centred on. Returns null when the canvas
+// cannot be read (CORS / decode failure) so the caller can use the per-ad
+// hand-tuned focus.
+function sampleBackdrop(src) {
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       try {
+        const grid = 24;
         const canvas = document.createElement('canvas');
-        canvas.width = 16;
-        canvas.height = 16;
+        canvas.width = grid;
+        canvas.height = grid;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(img, 0, 0, 16, 16);
-        const { data } = ctx.getImageData(0, 0, 16, 16);
-        let total = 0;
-        let counted = 0;
-        for (let i = 0; i < data.length; i += 4) {
-          if (data[i + 3] < 8) continue;
-          total += (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
-          counted += 1;
+        ctx.drawImage(img, 0, 0, grid, grid);
+        const { data } = ctx.getImageData(0, 0, grid, grid);
+
+        const luminance = new Float32Array(grid * grid);
+        for (let i = 0; i < grid * grid; i += 1) {
+          const offset = i * 4;
+          if (data[offset + 3] < 8) continue;
+          luminance[i] =
+            (0.2126 * data[offset] + 0.7152 * data[offset + 1] + 0.0722 * data[offset + 2]) / 255;
         }
-        resolve(counted === 0 ? null : total / counted);
+
+        const radius = 2;
+        let best = { index: 0, value: -1 };
+        for (let y = 0; y < grid; y += 1) {
+          for (let x = 0; x < grid; x += 1) {
+            let sum = 0;
+            let count = 0;
+            for (let dy = -radius; dy <= radius; dy += 1) {
+              for (let dx = -radius; dx <= radius; dx += 1) {
+                const yy = y + dy;
+                const xx = x + dx;
+                if (yy < 0 || yy >= grid || xx < 0 || xx >= grid) continue;
+                sum += luminance[yy * grid + xx];
+                count += 1;
+              }
+            }
+            const value = sum / count;
+            if (value > best.value) best = { index: y * grid + x, value };
+          }
+        }
+
+        const average =
+          luminance.reduce((total, value) => total + value, 0) / (grid * grid);
+
+        resolve({
+          average,
+          focusLuminance: best.value,
+          focus: {
+            x: ((best.index % grid) + 0.5) / grid,
+            y: (Math.floor(best.index / grid) + 0.5) / grid
+          }
+        });
       } catch {
         resolve(null);
       }
@@ -80,12 +157,24 @@ function sampleLuminance(src) {
   });
 }
 
+// background-position percentages that land `focus` on the target point of the
+// backdrop box. With the image sized to ZOOM × the box, moving the box by p% of
+// the overflow and the image point by f × ZOOM gives:
+//   p = (target - f × ZOOM) / (1 - ZOOM)
+function backdropPosition(focus) {
+  const axis = (target, fraction) => {
+    const percent = ((target - fraction * BACKDROP_ZOOM) / (1 - BACKDROP_ZOOM)) * 100;
+    return Math.min(100, Math.max(0, percent));
+  };
+  return { x: axis(BACKDROP_FOCUS.x, focus.x), y: axis(BACKDROP_FOCUS.y, focus.y) };
+}
+
 export default function LandingPage({ onEnter = () => {} }) {
   const [currentAdIndex, setCurrentAdIndex] = useState(0);
   const [failedAdId, setFailedAdId] = useState(null);
   // Sample is tied to the URL it came from so a stale reading never themes the
   // next ad while its image is still decoding.
-  const [sample, setSample] = useState({ url: null, luminance: null });
+  const [sample, setSample] = useState({ url: null, data: null });
   const ad = MOCK_ADS[currentAdIndex];
   const imageFailed = failedAdId === ad.id;
 
@@ -97,20 +186,29 @@ export default function LandingPage({ onEnter = () => {} }) {
     return () => clearInterval(timer);
   }, []);
 
-  // Re-sample the active creative so the hero typography can flip contrast.
+  // Re-sample the active creative so the backdrop follows its brightest region
+  // and the hero typography can flip contrast.
   useEffect(() => {
     let cancelled = false;
-    sampleLuminance(ad.imageUrl).then((luminance) => {
-      if (!cancelled) setSample({ url: ad.imageUrl, luminance });
+    sampleBackdrop(ad.imageUrl).then((data) => {
+      if (!cancelled) setSample({ url: ad.imageUrl, data });
     });
     return () => {
       cancelled = true;
     };
   }, [ad.imageUrl]);
 
-  const sampledLuminance = sample.url === ad.imageUrl ? sample.luminance : null;
-  const avgLuminance = sampledLuminance ?? ad.fallbackLuminance;
-  const isBrightBackdrop = avgLuminance > BRIGHT_THRESHOLD;
+  const sampled = sample.url === ad.imageUrl ? sample.data : null;
+  const frameLuminance = sampled?.average ?? ad.fallbackLuminance;
+  // Only a dark frame needs the bright-region crop; a creative that is already
+  // light keeps its original full-frame framing (that is the Starbucks look).
+  const cropToBrightRegion = frameLuminance <= BRIGHT_THRESHOLD;
+  const backdropLuminance = cropToBrightRegion
+    ? (sampled?.focusLuminance ?? ad.focusLuminance)
+    : frameLuminance;
+  const focus = sampled?.focus ?? ad.focus;
+  const isBrightBackdrop = backdropLuminance > BRIGHT_THRESHOLD;
+  const position = backdropPosition(focus);
 
   const ink = isBrightBackdrop ? '#111510' : '#FFFFFF';
   const inkSoft = isBrightBackdrop ? '#2B3129' : 'rgba(255,255,255,0.82)';
@@ -126,12 +224,19 @@ export default function LandingPage({ onEnter = () => {} }) {
         @keyframes heroAdFade { from { opacity: 0; transform: scale(1.02); } to { opacity: 1; transform: scale(1); } }
       `}</style>
 
-      {/* Full-bleed blurred live ad backdrop — follows the active creative */}
+      {/* Full-bleed blurred live ad backdrop — follows the active creative. A dark
+          frame is cropped onto its brightest region so the headline never sits on
+          a black corner of a saturated ad; a light frame keeps its framing. */}
       <div aria-hidden="true" className="absolute inset-0 z-0 overflow-hidden">
-        <img
-          src={ad.imageUrl}
-          alt=""
-          className="h-full w-full scale-125 object-cover blur-[75px] saturate-150 transition-all duration-1000 ease-in-out"
+        <div
+          className="absolute -inset-[12%] transition-all duration-1000 ease-in-out"
+          style={{
+            backgroundImage: `url("${ad.imageUrl}")`,
+            backgroundSize: cropToBrightRegion ? `${BACKDROP_ZOOM * 100}% ${BACKDROP_ZOOM * 100}%` : 'cover',
+            backgroundPosition: cropToBrightRegion ? `${position.x}% ${position.y}%` : '50% 50%',
+            backgroundRepeat: 'no-repeat',
+            filter: 'blur(75px) saturate(150%)'
+          }}
         />
         <div
           className="absolute inset-0 transition-colors duration-1000"
@@ -212,8 +317,7 @@ export default function LandingPage({ onEnter = () => {} }) {
             style={{ color: inkSoft }}
           >
             Paste a brand book, drop in an ad, and every claim, hex colour and banned term gets
-            checked before it ships. The player on the right is the live ad queue — the whole
-            backdrop is that creative, blurred, so nothing leaves your machine.
+            checked before it ships.
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <button
@@ -295,7 +399,7 @@ export default function LandingPage({ onEnter = () => {} }) {
                   className="h-2.5 w-2.5 rounded-full transition-colors duration-1000"
                   style={{ backgroundColor: ad.themeColor }}
                 />
-                {ad.themeColor} · Y {avgLuminance.toFixed(2)}
+                {ad.themeColor} · Y {backdropLuminance.toFixed(2)}
               </span>
             </div>
           </div>
