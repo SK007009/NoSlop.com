@@ -339,9 +339,7 @@ export function extractColorsFromCanvas(
         else neutralCounts.grey += 1;
         continue;
       }
-      // Tonal edges of a photograph are still brand-adjacent: only the extremes (page
-      // white, print black) are dropped, so a deep automotive red survives.
-      if (l > 0.92 || l < 0.08) continue;
+      if (l > 0.88 || l < 0.12) continue;
 
       const qr = Math.min(255, Math.round(r / 16) * 16);
       const qg = Math.min(255, Math.round(g / 16) * 16);
@@ -354,34 +352,18 @@ export function extractColorsFromCanvas(
   }
 
   const accepted = [];
-  // 1.5% of the frame was unreachable for photography: a lifestyle image scatters its
-  // pixels across hundreds of 16-step bins, so no bin ever cleared the floor and the
-  // palette came back empty. 0.6% still excludes a corner badge but admits texture.
-  const minimumCount = Math.max(1, sampled * 0.006);
-  const rankedBuckets = [...buckets.values()].sort((a, b) => b.count - a.count);
-  const acceptBucket = (bucket, minDelta) => {
-    if (accepted.length >= maxColors) return false;
-    const hex = rgbToHex(bucket.r, bucket.g, bucket.b);
-    // Lavender #D090FF / #C090F0 / #D090F0 are one colour to a reader.
-    if (accepted.some((existing) => hexDeltaE(hex, existing.hex) < minDelta)) return false;
-    accepted.push({ ...bucket, hex });
-    return true;
-  };
-
-  rankedBuckets.forEach((bucket) => {
-    if (bucket.count < minimumCount) return;
-    acceptBucket(bucket, 28);
-  });
-
-  // Fallback / top-up: guarantee a thematic palette of up to three dominant clusters,
-  // sorted by raw pixel count, when the strict pass found fewer. The tighter delta
-  // keeps a fallback palette from being three shades of the same hue.
-  if (accepted.length < 3) {
-    for (const bucket of rankedBuckets) {
-      if (accepted.length >= Math.min(3, maxColors)) break;
-      acceptBucket(bucket, 12);
-    }
-  }
+  const minimumCount = Math.max(1, sampled * 0.015);
+  [...buckets.values()]
+    .sort((a, b) => b.count - a.count)
+    .forEach((bucket) => {
+      if (accepted.length >= maxColors) return;
+      // A tiny annotation badge never covers 1.5% of the page.
+      if (bucket.count < minimumCount) return;
+      const hex = rgbToHex(bucket.r, bucket.g, bucket.b);
+      // Lavender #D090FF / #C090F0 / #D090F0 are one colour to a reader.
+      if (accepted.some((existing) => hexDeltaE(hex, existing.hex) < 28)) return;
+      accepted.push({ ...bucket, hex });
+    });
 
   const neutrals = includeNeutrals
     ? [

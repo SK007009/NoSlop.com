@@ -912,8 +912,6 @@ export async function auditSemanticClaims(adText, brandVault) {
 // word pattern that rejects them silently deleted "CAN’T" and "Starbucks®".
 const OCR_WORD_PATTERN = /^[a-zA-Z0-9%$.,'’‘"“”&®-]{2,}$/;
 
-const OCR_VOWELS = /[aeiouy]/i;
-
 /**
  * Tesseract invents text out of foliage, window frames and gradient noise: the output
  * is symbol soup, or consonant runs with no vowel structure. Every rule and model
@@ -921,34 +919,9 @@ const OCR_VOWELS = /[aeiouy]/i;
  * Numbers and short all-caps acronyms (BYD, SUV, 4K) survive.
  */
 export function sanitizeOcrText(rawText) {
-  const lines = String(rawText || '').split(/\r?\n/);
-  const kept = [];
-  for (const rawLine of lines) {
-    const line = rawLine.replace(/\s+/g, ' ').trim();
-    if (!line) continue;
-    const chars = line.replace(/\s/g, '');
-    if (chars.length < 3) continue;
-    const alnum = (chars.match(/[A-Za-z0-9]/g) || []).length;
-    // More than 30% symbols: address bars, dashed rules and tree texture all fail here.
-    if (alnum / chars.length < 0.7) continue;
-    if (!OCR_VOWELS.test(line)) continue;
-    const words = line.split(' ');
-    const readable = words.filter((word) => {
-      if (/^\d[\d.,%:/-]*$/.test(word)) return true;
-      // "4K", "5G", "3D": a digit with a one-letter unit is still a word.
-      if (/^\d+[A-Za-z]{1,2}$/.test(word)) return true;
-      const letters = word.replace(/[^A-Za-z]/g, '');
-      if (letters.length < 2) return false;
-      // Acronyms are real: BYD, SUV, EV, BMW.
-      if (letters.length <= 4 && /^[A-Z]+$/.test(letters)) return true;
-      if (!OCR_VOWELS.test(letters)) return false;
-      return !/[bcdfghjklmnpqrstvwxz]{6,}/i.test(letters);
-    });
-    // A line that is mostly debris is debris, even if one word looks sane.
-    if (readable.length / words.length < 0.6) continue;
-    kept.push(readable.join(' '));
-  }
-  return kept.join('\n');
+  // Soft noise strip: keep the core text (including stylised headlines) and drop
+  // only the excessive symbol noise that Tesseract invents on complex backgrounds.
+  return String(rawText || '').replace(/[^a-zA-Z0-9\s.,!?'-]/g, '');
 }
 
 function cleanOcrWord(text) {

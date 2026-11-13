@@ -1217,6 +1217,11 @@ export default function App() {
     setOriginalAdText(preset.adText);
     setWorkingAdText(preset.adText);
     setVisualColors([]);
+    // Tab 1's visual assets are brand-specific: logo crops shortlisted from a
+    // previously uploaded PDF (Starbucks, Nike…) must not sit in the gallery — or
+    // stay pending a choice — once a Spotify/Tesla benchmark is loaded.
+    setLogoCandidates([]);
+    setLogoChoicePending(false);
     setOverrides({});
     setRefineDrafts({});
     setWorkflowStatus('Draft — Awaiting Pre-Flight Audit');
@@ -1784,10 +1789,11 @@ export default function App() {
   // Once an audit has run both inputs freeze: the findings on screen belong to the
   // copy/banner that produced them, so changing either side silently would leave the
   // report describing something the user can no longer see. Clear the audit to edit.
+  const vaultEmpty = !brandVault?.sourceName || !Array.isArray(brandVault.rules) || brandVault.rules.length === 0;
   const textInputLocked =
-    Boolean(imagePreview) || isExtractingAdBanner || isRunningAudit || hasAudited;
+    vaultEmpty || Boolean(imagePreview) || isExtractingAdBanner || isRunningAudit || hasAudited;
   const imageUploadLocked =
-    workingAdText.trim().length > 0 || isExtractingAdBanner || isRunningAudit || hasAudited;
+    vaultEmpty || workingAdText.trim().length > 0 || isExtractingAdBanner || isRunningAudit || hasAudited;
   const diffs = diffWords(originalAdText, workingAdText);
 
   // Initials stamp for the signer block: first letter of the first two words.
@@ -2583,9 +2589,11 @@ export default function App() {
                   rows={6}
                   disabled={textInputLocked}
                   placeholder={
-                    imagePreview
-                      ? 'Text input disabled while an image is uploaded. Clear the image to enter text.'
-                      : 'Paste any advertisement copy, social caption, or promotional claim to audit...'
+                    vaultEmpty
+                      ? 'Please ingest a brand guideline in Tab 1 before running an audit.'
+                      : imagePreview
+                        ? 'Text input disabled while an image is uploaded. Clear the image to enter text.'
+                        : 'Paste any advertisement copy, social caption, or promotional claim to audit...'
                   }
                   className={`w-full rounded-2xl border p-3 text-sm text-[#141712] focus:outline-none ${
                     textInputLocked
@@ -2897,14 +2905,6 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleRunAudit}
-                      disabled={isRunningAudit}
-                      title="Re-run the pre-flight audit"
-                      className="w-10 h-10 rounded-full bg-[#121510] text-[#D8FF4B] flex items-center justify-center hover:bg-[#22261f] cursor-pointer disabled:opacity-60"
-                    >
-                      <Sparkles className="w-4 h-4" />
-                    </button>
                     <button
                       onClick={() => setActiveTab('workflow')}
                       title="Go to the sign-off gate"
@@ -3394,23 +3394,38 @@ export default function App() {
                             </td>
 
                             <td className="py-3 pl-3 text-right">
-                              <button
-                                onClick={() => handleUpdateBrandRule(group, draft)}
-                                disabled={!inVault}
-                                title={
-                                  inVault
-                                    ? 'Write the clarified rule and human justification into the active Brand Vault'
-                                    : 'Built-in policy check — no vault rule to update'
+                              {(() => {
+                                const canUpdateBrandRule =
+                                  currentUser?.role === 'manager' ||
+                                  currentUser?.role === 'legal' ||
+                                  /manager|legal/i.test(currentUser?.role || role || '');
+                                if (!canUpdateBrandRule) {
+                                  return (
+                                    <span className="inline-flex items-center gap-1.5 text-xs px-3.5 py-2 rounded-full font-medium whitespace-nowrap bg-white/10 text-[#F3F4EE]/40 cursor-not-allowed">
+                                      Requires Manager Approval
+                                    </span>
+                                  );
                                 }
-                                className={`inline-flex items-center gap-1.5 text-xs px-3.5 py-2 rounded-full font-medium whitespace-nowrap ${
-                                  inVault
-                                    ? 'bg-[#D8FF4B] hover:bg-[#e6ff7a] text-[#121411] cursor-pointer'
-                                    : 'bg-white/10 text-[#F3F4EE]/40 cursor-not-allowed'
-                                }`}
-                              >
-                                <Sparkles className="w-3.5 h-3.5" />
-                                {alreadyRefined ? 'Re-Sync Rule in Vault' : 'Update Brand Rule in Vault'}
-                              </button>
+                                return (
+                                  <button
+                                    onClick={() => handleUpdateBrandRule(group, draft)}
+                                    disabled={!inVault}
+                                    title={
+                                      inVault
+                                        ? 'Write the clarified rule and human justification into the active Brand Vault'
+                                        : 'Built-in policy check — no vault rule to update'
+                                    }
+                                    className={`inline-flex items-center gap-1.5 text-xs px-3.5 py-2 rounded-full font-medium whitespace-nowrap ${
+                                      inVault
+                                        ? 'bg-[#D8FF4B] hover:bg-[#e6ff7a] text-[#121411] cursor-pointer'
+                                        : 'bg-white/10 text-[#F3F4EE]/40 cursor-not-allowed'
+                                    }`}
+                                  >
+                                    <Sparkles className="w-3.5 h-3.5" />
+                                    {alreadyRefined ? 'Re-Sync Rule in Vault' : 'Update Brand Rule in Vault'}
+                                  </button>
+                                );
+                              })()}
                               {alreadyRefined && rule.refinedBy && (
                                 <p className="text-[10px] text-[#F3F4EE]/45 mt-1">
                                   {rule.refinedBy} • {rule.refinedAt}
