@@ -1,21 +1,70 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { diffWords } from 'diff';
 import {
   ShieldCheck, Upload, FileText, Image as ImageIcon, CheckCircle2,
-  Sparkles, GitPullRequest, BarChart3, Lock, Plus, Trash2
+  Sparkles, GitPullRequest, BarChart3, Lock, Plus, Trash2, RotateCcw
 } from 'lucide-react';
 import { extractTextFromPDF, extractGuidelinesFromImage, parseRawGuidelines } from './utils/guidelineParser';
-import { auditAdText, auditAdImage } from './utils/auditEngine';
+import {
+  auditAdText,
+  auditAdImage,
+  auditSemanticClaims,
+  computeGovernanceScore
+} from './utils/auditEngine';
+import {
+  warmUpLocalAi,
+  subscribeLocalAi,
+  getLocalAiStatus,
+  refineAmbiguousRuleWithLLM
+} from './utils/localAiEngine';
 import LandingPage from './LandingPage';
 
 // A rule with no authored replacement has no wording worth injecting, and any
 // generated placeholder is just as empty. Both mean "delete it", never "paste
 // this token into the ad copy".
+// One vision engine only: the fast, tested CLIP ViT-B/32. The high-res ViT-B/16 tier
+// was never validated end-to-end, so it is neither selectable nor ever downloaded.
+const VISION_ENGINE = 'Xenova/clip-vit-base-patch32';
+const VISION_ENGINE_LABEL = 'Xenova / CLIP-ViT-B/32';
+
 const isPlaceholderFix = (fix) =>
   !fix ||
   /approved (brand )?terminology|approved alternative|remove or rephrase|custom replacement/i.test(
     String(fix).trim()
   );
+
+// Only authored copy is editable here. A hex value, a grayscale level, a logo colour
+// or type baked into a raster cannot be rewritten by a text editor, so those cards
+// route to the artwork instead of offering a fix that cannot act on the file.
+// A finding can only "live in the artwork" when artwork was actually audited: with no
+// banner loaded, every finding that is not explicitly image-origin belongs to the
+// text box, even if an older rule forgot to tag its `source`.
+const isEditableTextIssue = (issue, adCopy = '', hasImage = false) => {
+  if (!issue) return false;
+  const copy = String(adCopy || '');
+  const isImageOnly = issue.source === 'image' || issue.actionType === 'edit-image';
+  if (!hasImage && copy.trim().length > 0 && !isImageOnly) return true;
+  if (issue.source === 'copy' || issue.actionType === 'append-disclaimer') return true;
+  if (isImageOnly) return false;
+  const category = String(issue.category || '');
+  if (/^(Image|Visual|Logo|Vision AI|WCAG|Contrast|Palette)/i.test(category)) return false;
+  const flagged = String(issue.offendingText || '').trim().toLowerCase();
+  if (!flagged) return false;
+  return copy.toLowerCase().includes(flagged);
+};
+
+const TERMINOLOGY_CATEGORIES = /Banned Terminology|AI Slop|Terminology Violation/i;
+
+// "Delve" → "explore" must not touch "delved" or "delver": the term is replaced as
+// a whole word, case-insensitively, with every other character left exactly as typed.
+const replaceWholeTerm = (text, term, replacement) => {
+  const raw = String(term || '');
+  if (!raw) return String(text || '');
+  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "['’]");
+  const lead = /^[a-z0-9]/i.test(raw) ? '\\b' : '';
+  const trail = /[a-z0-9]$/i.test(raw) ? '\\b' : '';
+  return String(text || '').replace(new RegExp(`${lead}${escaped}${trail}`, 'i'), replacement);
+};
 
 // Deleting a term leaves its punctuation orphaned ("payment hack!" -> "payment !"),
 // so collapse the gap and pull stray spaces off the punctuation that follows.
@@ -25,6 +74,23 @@ const stripOffendingText = (text, offending) =>
     .replace(/\s{2,}/g, ' ')
     .replace(/\s+([!.,?;:])/g, '$1')
     .trim();
+
+// The banner pass audits OCR text and the copy pass sees that same OCR text as
+// context, so one regulated claim can surface twice. Keep one card per
+// (category, offending text), preferring the copy-level finding that arrives first.
+// The sentence an issue lives in. Rewriting must never hand the model the entire
+// draft: a fix for one banned word would come back as a rewritten campaign.
+const dedupeIssues = (list) => {
+  const seen = new Set();
+  return list.filter((issue) => {
+    const key = `${String(issue.category || '').replace(/^Image OCR:\s*/, '')}|${String(
+      issue.offendingText || ''
+    ).toLowerCase()}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
 
 // 1-click real-world brand benchmarks so judges can demo without their own files.
 // Each guideline block is written the way an actual brand book reads: named swatches,
@@ -522,7 +588,55 @@ function certificatePdfBlob(canvas) {
 // Banner preview with an SVG bounding-box layer over the OCR word regions
 function AdBannerWithBoxes({ src, report }) {
   const [dims, setDims] = useState(null);
-  const boxes = (report?.boundingBoxes || []).filter((box) => box.x1 > box.x0 && box.y1 > box.y0);
+  // Tesseract emits one box per word fragment, so "selling" can arrive as an "s" box
+  // and an "elling" box. Boxes sharing a centreline within 10 px are joined before
+  // they are drawn.
+  const groupBoxesIntoLines = (input) => {
+    const lines = [];
+    [...input]
+      .sort((a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2)
+      .forEach((box) => {
+        const centreY = (box.y0 + box.y1) / 2;
+        const tolerance = Math.max(3, (box.y1 - box.y0) / 2);
+        const line = lines.find((entry) => Math.abs(entry.centreY - centreY) <= tolerance);
+        if (line) {
+          line.boxes.push(box);
+          line.centreY = (line.centreY * (line.boxes.length - 1) + centreY) / line.boxes.length;
+        } else {
+          lines.push({ centreY, boxes: [box] });
+        }
+      });
+    return lines.flatMap((line) =>
+      line.boxes
+        .sort((a, b) => a.x0 - b.x0)
+        .reduce((merged, box) => {
+          const prev = merged[merged.length - 1];
+          if (prev) {
+            const gap = box.x0 - prev.x1;
+            if (gap < 10) {
+              prev.x1 = Math.max(prev.x1, box.x1);
+              prev.y0 = Math.min(prev.y0, box.y0);
+              prev.y1 = Math.max(prev.y1, box.y1);
+              prev.text = [prev.text, box.text].filter(Boolean).join(' ');
+              prev.failsContrast = prev.failsContrast || box.failsContrast;
+              prev.contrast =
+                prev.contrast == null
+                  ? box.contrast
+                  : box.contrast == null
+                    ? prev.contrast
+                    : Math.min(prev.contrast, box.contrast);
+              return merged;
+            }
+          }
+          merged.push({ ...box });
+          return merged;
+        }, [])
+    );
+  };
+
+  const boxes = groupBoxesIntoLines(
+    (report?.boundingBoxes || []).filter((box) => box.x1 > box.x0 && box.y1 > box.y0)
+  );
   const failing = boxes.filter((box) => box.failsContrast).length;
 
   return (
@@ -591,6 +705,39 @@ function AdBannerWithBoxes({ src, report }) {
   );
 }
 
+// On-device model status: a green dot once both pipelines are resident in the tab, a
+// spinner while a cold download or an in-flight generation is running.
+function LocalAiBadge({ status }) {
+  const loading = status.status === 'loading';
+  const thinking = status.busy > 0;
+  const ready = status.status === 'ready';
+  const failed = status.status === 'error';
+  const label = thinking
+    ? 'Local WASM AI: Thinking…'
+    : ready
+      ? 'Local WASM AI: Ready (flan-t5-small + MiniLM-L6-v2)'
+      : loading
+        ? `Local WASM AI: Loading ${status.percent}%`
+        : failed
+          ? 'Local WASM AI: Offline — deterministic fallback'
+          : 'Local WASM AI: Idle';
+  const dot = failed ? 'bg-[#DF7A7A]' : ready ? 'bg-[#3F6B3A]' : 'bg-[#8A6D1F]';
+
+  return (
+    <span
+      title={failed && status.error ? `${status.message} (${status.error})` : status.message}
+      className="inline-flex items-center gap-2 bg-[#F3F4EE] px-3.5 py-2 rounded-full border border-black/10 text-[11px] font-medium text-[#2B3129] whitespace-nowrap"
+    >
+      {loading || thinking ? (
+        <span className="w-3 h-3 rounded-full border-2 border-[#121411]/25 border-t-[#121411] animate-spin" />
+      ) : (
+        <span className={`w-2 h-2 rounded-full ${dot}`} />
+      )}
+      {label}
+    </span>
+  );
+}
+
 // Decorative lime wave along the bottom edge of every matte charcoal card
 function LimeWave() {
   return (
@@ -619,20 +766,13 @@ function LimeWave() {
   );
 }
 
-// 240-degree open horseshoe: start at 150deg, sweep clockwise over the top to 30deg
-const TRUST_ARC_PATH = 'M 37.3 147 A 84 84 0 1 1 182.7 147';
+// One horseshoe, two paths: a grey track and a single progress stroke on the same
+// arc. The old three-segment arc bled where segments met and left a stray red dot.
+const TRUST_ARC_PATH = 'M 25 120 A 85 85 0 1 1 195 120';
 
-function TrustArcGauge({ trustScore, unresolvedCount, overriddenCount, totalIssues, hasAudited, workflowStatus }) {
-  const compliantCount = Math.max(0, totalIssues - unresolvedCount - overriddenCount);
-  // A clean audit (zero findings) paints a full compliant arc
-  const compliantValue = totalIssues === 0 && hasAudited ? 1 : compliantCount;
-  const total = Math.max(totalIssues, 1);
-  const segments = [
-    { key: 'compliant', value: compliantValue, color: '#6F86DC' },
-    { key: 'review', value: overriddenCount, color: '#E2CC62' },
-    { key: 'remediate', value: unresolvedCount, color: '#DF7A7A' }
-  ];
-  let offset = 0;
+function TrustArcGauge({ trustScore, unresolvedCount, overriddenCount, hasAudited, workflowStatus }) {
+  const score = hasAudited ? Math.max(0, Math.min(100, Math.round(Number(trustScore) || 0))) : 0;
+  const healthy = score === 100;
   const statusLabel = !hasAudited ? 'Awaiting Audit' : unresolvedCount > 0 ? 'Needs Remediation' : 'Compliant';
 
   return (
@@ -641,9 +781,8 @@ function TrustArcGauge({ trustScore, unresolvedCount, overriddenCount, totalIssu
         <h3 className="text-sm font-semibold tracking-tight">Pre-Publication Brand Trust</h3>
         <ul className="space-y-1.5 text-[11px]">
           {[
-            { color: '#6F86DC', label: `Compliant · ${hasAudited ? compliantValue : 0}` },
-            { color: '#E2CC62', label: `In Review / Overridden · ${overriddenCount}` },
-            { color: '#DF7A7A', label: `To Remediate · ${unresolvedCount}` }
+            { color: '#10B981', label: `Compliant · ${hasAudited ? `${score}%` : '—'}` },
+            { color: '#EF4444', label: `Open Issues · ${unresolvedCount + overriddenCount}` }
           ].map((item) => (
             <li key={item.label} className="flex items-center gap-2 text-[#2B3129]">
               <span className="h-2 w-2 rounded-full" style={{ backgroundColor: item.color }} />
@@ -655,37 +794,36 @@ function TrustArcGauge({ trustScore, unresolvedCount, overriddenCount, totalIssu
 
       <div className="relative mx-auto mt-2 w-full max-w-[260px]">
         <svg
-          viewBox="0 0 220 160"
+          viewBox="0 0 220 140"
           role="img"
-          aria-label={hasAudited ? `Brand trust score ${trustScore}%` : 'Brand trust score awaiting audit'}
+          aria-label={hasAudited ? `Brand trust score ${score}%` : 'Brand trust score awaiting audit'}
           className="w-full"
         >
-          <path d={TRUST_ARC_PATH} fill="none" stroke="#E2E4DC" strokeWidth="16" strokeLinecap="round" />
-          {hasAudited &&
-            segments.map((segment) => {
-              const length = (segment.value / total) * 100;
-              const dashOffset = -offset;
-              offset += length;
-              if (length <= 0) return null;
-              return (
-                <path
-                  key={segment.key}
-                  d={TRUST_ARC_PATH}
-                  pathLength="100"
-                  fill="none"
-                  stroke={segment.color}
-                  strokeWidth="16"
-                  strokeLinecap="round"
-                  strokeDasharray={`${length} ${100 - length}`}
-                  strokeDashoffset={dashOffset}
-                  className="transition-all duration-700 ease-out"
-                />
-              );
-            })}
+          <path
+            d={TRUST_ARC_PATH}
+            fill="none"
+            stroke="#E5E7EB"
+            strokeWidth="16"
+            strokeLinecap="round"
+          />
+          {hasAudited && score > 0 && (
+            <path
+              d={TRUST_ARC_PATH}
+              pathLength="100"
+              fill="none"
+              stroke={healthy ? '#10B981' : '#EF4444'}
+              strokeWidth="16"
+              strokeLinecap="round"
+              strokeDasharray={`${score} 100`}
+              strokeDashoffset="0"
+              style={{ stroke: healthy ? '#10B981' : '#EF4444' }}
+              className="transition-all duration-700 ease-out"
+            />
+          )}
         </svg>
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center pt-8 text-center">
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center pt-6 text-center">
           <span className="text-4xl font-bold tracking-tight text-[#121411]">
-            {hasAudited ? `${trustScore}%` : '—'}
+            {hasAudited ? `${score}%` : '—'}
           </span>
           <span className="mt-1 text-[11px] font-medium text-[#5E6759]">{statusLabel}</span>
         </div>
@@ -843,13 +981,133 @@ function HowItWorksGuide({ onGoToStep1 }) {
   );
 }
 
+// The vault is always an object, never null: every Tab 1 card and the Tab 2 audit
+// read its arrays directly, so "empty" is this shape rather than a null check.
+const EMPTY_BRAND_VAULT = {
+  sourceName: 'None Loaded',
+  brandName: '',
+  rawText: '',
+  colors: [],
+  bannedTerms: [],
+  facts: [],
+  regulatoryRules: [],
+  minContrastRatio: 4.5,
+  logoSpec: null,
+  logoConditions: null
+};
+
+// Closed-testing demo accounts. The role attached here is the only source of truth
+// for RBAC once the user signs in — the workspace has no role switcher.
+const DEMO_ACCOUNTS = [
+  { id: 'demo_creator', name: 'Demo Creator', email: 'creator@noslop.com', role: 'Creator', avatar: '🎨' },
+  { id: 'demo_manager', name: 'Demo Manager', email: 'manager@noslop.com', role: 'Brand Manager (Approver)', avatar: '👔' },
+  { id: 'demo_advocate', name: 'Demo Advocate', email: 'legal@noslop.com', role: 'Legal / Compliance', avatar: '⚖️' }
+];
+
+// Google-style saved-account picker. A typed email is never honoured: this build is
+// closed testing, so the only way in is a pre-provisioned demo identity.
+function DemoLoginPage({ onLogin }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    setLoginError('Account not registered for closed testing, contact admin.');
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
+      <div className="w-full max-w-md bg-white border border-gray-200 rounded-3xl shadow-[0_20px_60px_rgba(15,23,42,0.08)] p-8">
+        <div className="text-center mb-6">
+          <div className="mx-auto w-12 h-12 rounded-2xl bg-[#121411] text-[#D8FF4B] flex items-center justify-center">
+            <ShieldCheck className="w-6 h-6" />
+          </div>
+          <h1 className="mt-4 text-xl font-semibold tracking-tight text-gray-900">Sign in to NoSlop</h1>
+          <p className="mt-1 text-xs text-gray-500">Brand governance workspace · closed demo</p>
+        </div>
+
+        <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2">
+          Choose a Saved Account
+        </p>
+        <div className="space-y-2">
+          {DEMO_ACCOUNTS.map((account) => (
+            <button
+              key={account.id}
+              type="button"
+              onClick={() => onLogin(account)}
+              className="w-full flex items-center gap-3 text-left border border-gray-200 rounded-2xl px-3 py-2.5 hover:border-gray-400 hover:bg-gray-50 transition cursor-pointer"
+            >
+              <span className="w-9 h-9 rounded-full bg-gray-100 flex items-center justify-center text-lg" aria-hidden="true">
+                {account.avatar}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-medium text-gray-900 truncate">{account.name}</span>
+                <span className="block text-[11px] text-gray-500 truncate">{account.email}</span>
+              </span>
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 whitespace-nowrap">
+                {account.role}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <div className="my-6 flex items-center gap-3 text-[11px] uppercase tracking-wider text-gray-400">
+          <span className="h-px flex-1 bg-gray-200" />or login as new user<span className="h-px flex-1 bg-gray-200" />
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-2">
+          <input
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            placeholder="Email"
+            className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm text-gray-900 focus:border-gray-900 focus:outline-none"
+          />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            placeholder="Password"
+            className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm text-gray-900 focus:border-gray-900 focus:outline-none"
+          />
+          <button
+            type="submit"
+            className="w-full rounded-xl bg-gray-900 text-white text-sm font-semibold py-2.5 hover:bg-gray-800 cursor-pointer"
+          >
+            Sign In
+          </button>
+          {loginError && (
+            <p className="text-xs text-red-600" role="alert">
+              {loginError}
+            </p>
+          )}
+        </form>
+
+        <p className="mt-4 text-center text-[10px] text-gray-400">
+          Demo only — accounts are local, nothing is transmitted.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [view, setView] = useState('landing');
   // 'tabs' shows the five workspace tabs; 'product' and 'guide' are the other two
   // destinations the landing navbar can open inside this same window.
   const [workspaceView, setWorkspaceView] = useState('tabs');
   const [activeTab, setActiveTab] = useState('compiler');
-  const [role, setRole] = useState('Creator');
+  // Demo authentication gate. `isLoggedIn` renders the workspace; `currentUser` is the
+  // signed-in demo identity and the only source of the active role.
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  // The role is locked at sign-in (setActiveRole runs once, in onLogin) — every
+  // existing approval check reads this alias, so there is no way to escalate in-app.
+  const [activeRole, setActiveRole] = useState('Creator');
+  const role = activeRole;
   // Starts genuinely empty: no demo brand book, no pre-filled ad copy, no seeded
   // history. A preset arrives only if the user picks one from the header dropdown.
   const [rawGuidelineText, setRawGuidelineText] = useState('');
@@ -858,20 +1116,16 @@ export default function App() {
   // Palette colours sampled from PDF pages / guideline artwork, kept so a manual
   // re-compile still merges what the canvas found.
   const [visualColors, setVisualColors] = useState([]);
+  // Human-in-the-loop logo pick: every region the extractor shortlisted, and whether
+  // a reviewer has confirmed (or skipped) one yet.
+  const [logoCandidates, setLogoCandidates] = useState([]);
+  const [logoChoicePending, setLogoChoicePending] = useState(false);
   const [isExtractingGuideline, setIsExtractingGuideline] = useState(false);
   const [parsePercent, setParsePercent] = useState(0);
   const [guidelineProgressText, setGuidelineProgressText] = useState('');
   // Reviewer-typed replacements for banned terms that have no approved wording.
   const [customFixes, setCustomFixes] = useState({});
-  const [brandVault, setBrandVault] = useState({
-    sourceName: 'None Loaded',
-    brandName: '',
-    rawText: '',
-    colors: [],
-    bannedTerms: [],
-    facts: [],
-    minContrastRatio: 4.5
-  });
+  const [brandVault, setBrandVault] = useState(EMPTY_BRAND_VAULT);
 
   // Manual Rule Inputs
   const [newTerm, setNewTerm] = useState('');
@@ -883,18 +1137,33 @@ export default function App() {
   const [originalAdText, setOriginalAdText] = useState('');
   const [workingAdText, setWorkingAdText] = useState('');
   const [imagePreview, setImagePreview] = useState(null);
+  // Bumped whenever the banner is cleared so the <input type="file"> remounts and
+  // drops the File it was holding; without it the same file could not be re-picked.
+  const [adInputKey, setAdInputKey] = useState(0);
   const [ocrProgress, setOcrProgress] = useState(0);
   const [isRunningAudit, setIsRunningAudit] = useState(false);
   const [isExtractingAdBanner, setIsExtractingAdBanner] = useState(false);
   const [adAuditProgressText, setAdAuditProgressText] = useState('');
   const [issues, setIssues] = useState([]);
   const [imageReport, setImageReport] = useState(null);
+  // Tab 2 vision engine choice and the live telemetry the audit streams back while it
+  // downloads weights and reasons over the creative.
+  const [visionTelemetry, setVisionTelemetry] = useState(null);
+  const [visionElapsed, setVisionElapsed] = useState(0);
 
   // Workflow & Governance State
   const [workflowStatus, setWorkflowStatus] = useState('Draft — Awaiting Pre-Flight Audit');
+  // A status string alone is not proof that an audit ran: every reset path clears
+  // this flag, so an empty workspace can never inherit a 100% "publication ready"
+  // score from the run that preceded it.
+  const [hasRunAudit, setHasRunAudit] = useState(false);
   const [overrides, setOverrides] = useState({});
   // Per-rule edit drafts for the Tab 4 Auto-Refiner, editable before commit
   const [refineDrafts, setRefineDrafts] = useState({});
+  // On-device AI: engine status, the rewrites it has drafted (kept out of the draft
+  // copy until accepted) and which card / rule is currently being generated.
+  const [aiStatus, setAiStatus] = useState(getLocalAiStatus);
+  const [autoRefiningId, setAutoRefiningId] = useState('');
   const [revisionHistory, setRevisionHistory] = useState([]);
   const [commentInput, setCommentInput] = useState('');
   const [comments, setComments] = useState([]);
@@ -906,11 +1175,39 @@ export default function App() {
   const [assetSeal, setAssetSeal] = useState('');
   const [certificateStatus, setCertificateStatus] = useState('');
 
+  // The model reports its own elapsed time while bytes stream in, but the audit as a
+  // whole (OCR, logo scan, inference) needs a ticker that keeps moving every 200 ms.
+  const visionStartRef = useRef(0);
+  useEffect(() => {
+    if (!isRunningAudit) return undefined;
+    const id = setInterval(() => {
+      setVisionElapsed((performance.now() - visionStartRef.current) / 1000);
+    }, 200);
+    return () => clearInterval(id);
+  }, [isRunningAudit]);
+
   // Load a 1-click industry test case (guidelines + matching ad draft)
   const handleApplyPreset = (e) => {
     const preset = AD_PRESETS.find((p) => p.id === e.target.value);
     e.target.value = '';
     if (!preset) return;
+
+    // A benchmark load is a clean slate: a banner uploaded for another brand, its OCR
+    // report and every Tab 2 finding must not survive into this demo.
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+    setImagePreview(null);
+    setImageReport(null);
+    setIssues([]);
+    setOverrides({});
+    setCustomFixes({});
+    setVisionTelemetry(null);
+    setVisionElapsed(0);
+    setOcrProgress(0);
+    setAdAuditProgressText('');
+    setIsExtractingAdBanner(false);
+    setHasRunAudit(false);
+    // Remount the file input so it stops holding the previous File object.
+    setAdInputKey((key) => key + 1);
 
     const compiled = parseRawGuidelines(preset.guidelines, preset.sourceName);
     setRawGuidelineText(preset.guidelines);
@@ -919,8 +1216,6 @@ export default function App() {
     setBrandVault(compiled);
     setOriginalAdText(preset.adText);
     setWorkingAdText(preset.adText);
-    setIssues([]);
-    setImageReport(null);
     setVisualColors([]);
     setOverrides({});
     setRefineDrafts({});
@@ -938,7 +1233,16 @@ export default function App() {
 
   // Compile pasted or uploaded guidelines
   const handleCompileGuidelines = () => {
-    const compiled = parseRawGuidelines(rawGuidelineText, sourceName || 'Custom Brand Guidelines', visualColors);
+    // The button is locked without input, but the handler guards too: an empty
+    // compile would otherwise replace the vault with placeholder rules.
+    if (!rawGuidelineText.trim() && visualColors.length === 0) return;
+    const compiled = parseRawGuidelines(
+      rawGuidelineText,
+      sourceName || 'Custom Brand Guidelines',
+      visualColors,
+      // A re-compile must not throw away the mark already cropped off the deck.
+      brandVault.logoSpec || null
+    );
     setBrandVault(compiled);
     setIsCompiled(true);
     setRevisionHistory((prev) => [
@@ -969,26 +1273,64 @@ export default function App() {
     try {
       let text = '';
       let sampledColors = [];
+      let logoSpec = null;
+      let extractedCandidates = [];
+      // Only PDFs and images run the canvas scanner; plain text has no artwork to
+      // shortlist, so it skips the HITL gallery entirely.
+      let logoScanAttempted = false;
 
       if (lower.endsWith('.pdf')) {
         setGuidelineProgressText('Scanning PDF pages & extracting visual brand rules…');
         const extracted = await extractTextFromPDF(file, onProgress);
         text = extracted.text;
         sampledColors = extracted.visualColors;
+        logoSpec = extracted.logoSpec || null;
+        extractedCandidates = extracted.candidateLogos || logoSpec?.candidateLogos || [];
+        logoScanAttempted = true;
       } else if (/\.(png|jpe?g|webp)$/.test(lower)) {
         setGuidelineProgressText('Scanning image & extracting visual brand rules…');
         const extracted = await extractGuidelinesFromImage(file, onProgress);
         text = extracted.text;
         sampledColors = extracted.visualColors;
+        logoSpec = extracted.logoSpec || null;
+        extractedCandidates = extracted.candidateLogos || logoSpec?.candidateLogos || [];
+        logoScanAttempted = true;
       } else {
         text = await file.text();
         onProgress(100, 'Text file read');
       }
 
       const trimmed = (text || '').trim();
-      const compiled = parseRawGuidelines(trimmed, file.name, sampledColors);
+      const compiled = parseRawGuidelines(trimmed, file.name, sampledColors, logoSpec);
+      const candidates = extractedCandidates;
       setVisualColors(sampledColors);
       setBrandVault(compiled);
+      // The top-scoring crop is preloaded as the working mark, but the reviewer has
+      // the final say: the gallery keeps showing until one is picked or skipped.
+      setLogoCandidates(candidates);
+      // A scan that found nothing still asks the human: the gallery then offers only
+      // manual upload and skip, instead of silently locking a bad crop in.
+      setLogoChoicePending(logoScanAttempted);
+      // A new brand book invalidates every existing finding: an issue card left over
+      // from the previous deck would keep citing a PDF that is no longer loaded. The
+      // Tab 2 draft is reset with it — a banner and copy audited against the old deck
+      // must not survive the swap, or the next audit reports findings for a brand the
+      // user is no longer looking at.
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+      setImagePreview(null);
+      setImageReport(null);
+      setWorkingAdText('');
+      setOriginalAdText('');
+      setIssues([]);
+      setOverrides({});
+      setCustomFixes({});
+      setVisionTelemetry(null);
+      setOcrProgress(0);
+      setAdAuditProgressText('');
+      // `hasAudited` is derived from this status, and the draft status is what hides
+      // the progress bars, horseshoe and reported-issues panels again.
+      setHasRunAudit(false);
+      setWorkflowStatus('Draft — Awaiting Pre-Flight Audit');
 
       if (trimmed.length === 0) {
         setRawGuidelineText('');
@@ -1020,6 +1362,9 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    // The uploader is disabled while copy exists; ignoring a stray change event keeps
+    // the two inputs mutually exclusive even if the label is triggered programmatically.
+    if (workingAdText.trim().length > 0 || isRunningAudit) return;
 
     setIsExtractingAdBanner(true);
     setAdAuditProgressText(`Preparing ${file.name}…`);
@@ -1048,29 +1393,184 @@ export default function App() {
   const handleRunAudit = async () => {
     setIsRunningAudit(true);
     setOcrProgress(0);
+    visionStartRef.current = performance.now();
+    setVisionElapsed(0);
+    setVisionTelemetry({
+      phase: 'reasoning',
+      step: 'Starting the on-device vision engine…',
+      // Fixed engine: the fast, tested CLIP ViT-B/32 repo, always.
+      model: VISION_ENGINE,
+      modelName: VISION_ENGINE_LABEL
+    });
     setAdAuditProgressText('Auditing ad copy against the compiled rules…');
-    const textIssues = auditAdText(workingAdText, brandVault);
-    let combinedIssues = [...textIssues];
 
+    let imageIssues = [];
+    let bannerText = '';
     if (imagePreview) {
-      const imgRes = await auditAdImage(imagePreview, brandVault, (percent) => {
-        setOcrProgress(percent);
-        setAdAuditProgressText(`Running OCR & WCAG contrast scan (${percent}%)…`);
-      });
+      const imgRes = await auditAdImage(
+        imagePreview,
+        brandVault,
+        (percent) => {
+          setOcrProgress(percent);
+          setAdAuditProgressText(`Scanning banner — OCR, WCAG & vision (${percent}%)…`);
+        },
+        {
+          onTelemetry: setVisionTelemetry,
+          // The copy can name a competitor even when the artwork is clean, so the
+          // rival-brand scan reads both.
+          adCopy: workingAdText
+        }
+      );
       setImageReport(imgRes);
-      combinedIssues = [...combinedIssues, ...imgRes.issues];
+      imageIssues = imgRes.issues;
+      bannerText = imgRes.ocrText || '';
     } else {
       setImageReport(null);
     }
 
+    // The banner's OCR text travels with the copy so a regulated claim printed on the
+    // artwork cannot dodge the mandatory-disclaimer check.
+    const textIssues = auditAdText(workingAdText, brandVault, { extraText: bannerText });
+
+    setAdAuditProgressText('Comparing claims against the fact ledger…');
+    const semanticIssues = await auditSemanticClaims(workingAdText, brandVault);
+    // A sentence the deterministic metric check already flagged does not need a
+    // second, vector-similarity card saying the same thing about the same number.
+    const factFlaggedSentences = new Set(
+      [...textIssues, ...imageIssues]
+        .filter((issue) => /Contradictory Fact/.test(String(issue.category || '')))
+        .map((issue) => String(issue.offendingText || '').trim().toLowerCase())
+    );
+    const semanticUnique = semanticIssues.filter(
+      (issue) => !factFlaggedSentences.has(String(issue.offendingText || '').trim().toLowerCase())
+    );
+    const combinedIssues = dedupeIssues([...textIssues, ...imageIssues, ...semanticUnique]);
+
     setIssues(combinedIssues);
+    setHasRunAudit(true);
     setWorkflowStatus(combinedIssues.length === 0 ? 'Ready for Approval' : 'Flags Detected — Needs Remediation');
     setRevisionHistory((prev) => [
       { time: new Date().toLocaleTimeString(), actor: role, action: `Ran Pre-Flight Audit: ${combinedIssues.length} compliance flags found` },
       ...prev
     ]);
     setIsRunningAudit(false);
+    setVisionTelemetry(null);
     setAdAuditProgressText('');
+  };
+
+  // Clearing a finished audit returns the whole Tab 2 surface to its pre-run state,
+  // so the text/image exclusivity starts from a blank slate instead of inheriting
+  // whichever input the last run happened to use.
+  const handleClearAudit = () => {
+    if (isRunningAudit || isExtractingAdBanner) return;
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+    setImagePreview(null);
+    setAdInputKey((key) => key + 1);
+    setWorkingAdText('');
+    setOriginalAdText('');
+    setIssues([]);
+    setImageReport(null);
+    setOverrides({});
+    setCustomFixes({});
+    setVisionTelemetry(null);
+    setVisionElapsed(0);
+    setOcrProgress(0);
+    setAdAuditProgressText('');
+    setHasRunAudit(false);
+    setWorkflowStatus('Draft — Awaiting Pre-Flight Audit');
+  };
+
+  // Dropping the compiled vault also drops everything audited against it: a finding
+  // card left on screen would cite guidelines that are no longer loaded.
+  const handleClearVault = () => {
+    if (isExtractingGuideline) return;
+    setBrandVault(EMPTY_BRAND_VAULT);
+    setRawGuidelineText('');
+    setSourceName('');
+    setVisualColors([]);
+    setIsCompiled(false);
+    setParsePercent(0);
+    setGuidelineProgressText('');
+    setLogoCandidates([]);
+    setLogoChoicePending(false);
+    handleClearAudit();
+    setActiveTab('compiler');
+  };
+
+  // Judge reset: a factory reset across all five tabs, not just the Tab 2 draft.
+  // Tab 3 reads overrides and the revision log, Tab 4 reads the vault and the refine
+  // drafts, Tab 5 reads the seal — all of them are wiped with the workspace.
+  const handleFactoryReset = () => {
+    handleClearVault();
+    setRevisionHistory([]);
+    setOverrides({});
+    setRefineDrafts({});
+    setCustomFixes({});
+    setSourceName('Custom_Input.txt');
+    setAssetSeal('');
+    setCertificateStatus('');
+  };
+
+  // Human-in-the-loop logo confirmation. Selecting a candidate promotes exactly that
+  // crop to the vault; skipping leaves the mark empty so the audit never compares the
+  // banner against a product photo.
+  const handleSelectLogo = (candidate) => {
+    setBrandVault((v) => ({ ...v, logoSpec: { ...candidate, page: v.logoSpec?.page || null } }));
+    setLogoChoicePending(false);
+    setRevisionHistory((prev) => [
+      {
+        time: new Date().toLocaleTimeString(),
+        actor: role,
+        action: `Confirmed primary brand mark: ${candidate.logoType === 'wordmark' ? 'wordmark' : 'emblem'} at ${candidate.aspectRatio}:1`
+      },
+      ...prev
+    ]);
+  };
+
+  // Escape hatch: a deck whose artwork defeats the canvas scanner still gets a real
+  // lockup — the user supplies it, and the gallery closes immediately.
+  const handleManualLogoUpload = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      if (!dataUrl) return;
+      const probe = new Image();
+      probe.onload = () => {
+        setBrandVault((v) => ({
+          ...v,
+          logoSpec: {
+            src: dataUrl,
+            aspectRatio: Number((probe.naturalWidth / Math.max(1, probe.naturalHeight)).toFixed(2)),
+            logoType: 'manual-upload',
+            logoColors: []
+          }
+        }));
+        setLogoChoicePending(false);
+        setRevisionHistory((prev) => [
+          {
+            time: new Date().toLocaleTimeString(),
+            actor: role,
+            action: `Uploaded the primary brand mark manually (${probe.naturalWidth}×${probe.naturalHeight}px)`
+          },
+          ...prev
+        ]);
+      };
+      probe.onerror = () => setLogoChoicePending(true);
+      probe.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleSkipLogo = () => {
+    setBrandVault((v) => ({ ...v, logoSpec: null }));
+    setLogoChoicePending(false);
+    setRevisionHistory((prev) => [
+      { time: new Date().toLocaleTimeString(), actor: role, action: 'Marked the deck as having no usable brand mark (skipped logo selection)' },
+      ...prev
+    ]);
   };
 
   // Apply 1-Click Surgical Fix. A placeholder or missing fix has no wording to
@@ -1084,7 +1584,14 @@ export default function App() {
     }
 
     const replacement = custom || issue.suggestedFix;
-    setWorkingAdText((prev) => prev.replace(issue.offendingText, replacement));
+    // A banned term or slop word is swapped as an exact whole word; only genuinely
+    // semantic findings fall back to a plain substring replacement.
+    const isTerminology = TERMINOLOGY_CATEGORIES.test(String(issue.category || ''));
+    setWorkingAdText((prev) =>
+      isTerminology
+        ? replaceWholeTerm(prev, issue.offendingText, replacement)
+        : prev.replace(issue.offendingText, replacement)
+    );
     setIssues((prev) => prev.filter((i) => i.id !== issue.id));
     setCustomFixes((prev) => {
       const next = { ...prev };
@@ -1155,7 +1662,7 @@ export default function App() {
     if (!reason) return;
     setOverrides((prev) => ({
       ...prev,
-      [issue.id]: { reason, ruleId: issue.ruleId, category: issue.category, actor: role }
+      [issue.id]: { reason, ruleId: issue.ruleId, category: issue.category, actor: role, status: 'pending' }
     }));
     setRevisionHistory((prev) => [
       { time: new Date().toLocaleTimeString(), actor: role, action: `Requested exception override on ${issue.id}: "${reason}"` },
@@ -1163,32 +1670,124 @@ export default function App() {
     ]);
   };
 
-  // Image findings live inside the artwork, so the only local action is to accept
-  // the risk — record it as an override without prompting for a reason.
-  const handleSkipImageIssue = (issue) => {
-    const reason = 'Skipped — banner artwork kept as is (image edits happen outside NoSlop)';
+  // Manager decisions on a creator's exception request: approval drops the penalty
+  // from the trust score, rejection deletes the override so the finding is open again.
+  const handleApproveOverride = (issue) => {
     setOverrides((prev) => ({
       ...prev,
-      [issue.id]: { reason, ruleId: issue.ruleId, category: issue.category, actor: role }
+      [issue.id]: {
+        ...prev[issue.id],
+        status: 'approved',
+        reviewedBy: role,
+        reviewedAt: new Date().toISOString()
+      }
     }));
     setRevisionHistory((prev) => [
       {
         time: new Date().toLocaleTimeString(),
         actor: role,
-        action: `Skipped image issue ${issue.id}: "${reason}"`
+        action: `APPROVED exception on ${issue.id} — penalty removed from the trust score`
       },
       ...prev
     ]);
   };
 
+  const handleRejectOverride = (issue) => {
+    setOverrides((prev) => {
+      const next = { ...prev };
+      delete next[issue.id];
+      return next;
+    });
+    setRevisionHistory((prev) => [
+      {
+        time: new Date().toLocaleTimeString(),
+        actor: role,
+        action: `REJECTED exception on ${issue.id} — the creator must remediate it`
+      },
+      ...prev
+    ]);
+  };
+
+  // Primary remediation for a regulated claim: append the mandated footnote to the
+  // bottom of the draft, where the diff viewer paints it green.
+  const handleAppendDisclaimer = (issue) => {
+    // The raw rule text starts with an asterisk for the old inline-footnote style;
+    // the appended line is plain "Disclaimer- …".
+    const footnote = String(issue.suggestedFix || '')
+      .replace(/^[\s*]+/, '')
+      .trim();
+    if (!footnote) return;
+    setWorkingAdText((prev) => {
+      const base = String(prev || '').replace(/\s+$/, '');
+      return base ? `${base}\n\nDisclaimer- ${footnote}` : `Disclaimer- ${footnote}`;
+    });
+    setIssues((prev) => prev.filter((i) => i.id !== issue.id));
+    setRevisionHistory((prev) => [
+      {
+        time: new Date().toLocaleTimeString(),
+        actor: role,
+        action: `Appended mandatory legal disclaimer for [${issue.category}]: "${footnote.slice(0, 64)}…"`
+      },
+      ...prev
+    ]);
+  };
+
+  // Tab 4: let the local LLM draft the clarified rule from the reviewers' own
+  // justifications, straight into the editable refinement box.
+  const handleAutoRefineRule = async (group) => {
+    const rule = findVaultRule(group.ruleId);
+    const original = rule
+      ? rule.statement ||
+        (rule.term
+          ? `Never use "${rule.term}".${rule.replacement ? ` Use "${rule.replacement}" instead.` : ''} ${rule.reason || ''}`.trim()
+          : `Approved brand colour ${rule.hex}${rule.name ? ` (${rule.name})` : ''} may be used for this asset.`)
+      : `${group.category || 'Brand'} compliance requirement`;
+
+    setAutoRefiningId(group.ruleId);
+    try {
+      const refined = await refineAmbiguousRuleWithLLM(
+        original,
+        group.entries.map((entry) => entry.reason).filter(Boolean)
+      );
+      if (refined) updateRefineDraft(group.ruleId, { justification: refined });
+    } finally {
+      setAutoRefiningId('');
+    }
+  };
+
   const unresolvedCount = issues.filter((i) => !overrides[i.id]).length;
-  const trustScore = Math.max(0, 100 - unresolvedCount * 14);
-  // A run has happened once the workflow leaves its initial draft state.
-  const hasAudited = workflowStatus !== 'Draft — Awaiting Pre-Flight Audit';
+  // Exception requests still waiting on a manager. Approved ones are settled and no
+  // longer count as open work anywhere in the UI.
+  const pendingOverrideIssues = issues.filter(
+    (issue) => overrides[issue.id] && overrides[issue.id].status !== 'approved'
+  );
+  const pendingOverrideCount = pendingOverrideIssues.length;
+  // A run has happened once the workflow leaves its initial draft state *and* an
+  // audit actually completed against the current workspace.
+  const hasAudited = hasRunAudit && workflowStatus !== 'Draft — Awaiting Pre-Flight Audit';
+  // Weighted checkpoint score: severity penalties, half restored on a logged
+  // override (with a 5-point review floor), clamped to 5–100.
+  const governance = computeGovernanceScore(issues, overrides, { hasAudited });
+  const trustScore = governance.score;
+  // A perfect score with nothing outstanding is the one state that is publication
+  // ready, whatever label the last audit wrote into workflowStatus.
+  const auditAllClear = hasAudited && trustScore === 100 && unresolvedCount === 0;
   // Both auditor inputs are optional individually, but an audit with neither has
   // nothing to read; extraction and a running audit also keep the button locked.
+  // Tab 1 ingest gate: typed guidelines, or an upload that sampled at least one
+  // colour. Without either there is nothing to compile.
+  const hasIngestInput = Boolean(rawGuidelineText.trim()) || visualColors.length > 0;
   const hasAuditInput = workingAdText.trim().length > 0 || Boolean(imagePreview);
   const auditLocked = isExtractingAdBanner || isRunningAudit || !hasAuditInput;
+  // Copy and artwork are alternative inputs, never a pair: each locks the other
+  // while it is present, so a run can only ever audit one of them at a time.
+  // Once an audit has run both inputs freeze: the findings on screen belong to the
+  // copy/banner that produced them, so changing either side silently would leave the
+  // report describing something the user can no longer see. Clear the audit to edit.
+  const textInputLocked =
+    Boolean(imagePreview) || isExtractingAdBanner || isRunningAudit || hasAudited;
+  const imageUploadLocked =
+    workingAdText.trim().length > 0 || isExtractingAdBanner || isRunningAudit || hasAudited;
   const diffs = diffWords(originalAdText, workingAdText);
 
   // Initials stamp for the signer block: first letter of the first two words.
@@ -1237,6 +1836,17 @@ export default function App() {
       cancelled = true;
     };
   }, [sealPayload]);
+
+  useEffect(() => subscribeLocalAi(setAiStatus), []);
+
+  // Warm the WASM pipelines as soon as the workspace opens, so the first audit is
+  // not also the first 80 MB download. Failures surface in the badge and every
+  // helper falls back to its deterministic path.
+  useEffect(() => {
+    if (view !== 'app') return undefined;
+    const timer = setTimeout(() => warmUpLocalAi(), 800);
+    return () => clearTimeout(timer);
+  }, [view]);
 
   // Paint the A4 certificate, wrap it in a PDF and hand it to the browser as a
   // download. Nothing here touches the network: the canvas and the PDF bytes are
@@ -1397,6 +2007,21 @@ export default function App() {
     );
   }
 
+  // Closed-testing gate: every entry point into the workspace (Get Started, Launch
+  // Workspace, a direct tab link) lands here until a saved account is chosen.
+  if (!isLoggedIn) {
+    return (
+      <DemoLoginPage
+        onLogin={(user) => {
+          setCurrentUser(user);
+          setActiveRole(user.role);
+          setIsLoggedIn(true);
+          setView('app');
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#C8CFC0] text-[#141712] flex flex-col">
       {/* Top Navbar */}
@@ -1437,31 +2062,28 @@ export default function App() {
           </div>
 
           <button
-            onClick={() => {
-              setRawGuidelineText('');
-              setIsCompiled(false);
-              setSourceName('Custom_Input.txt');
-              setOriginalAdText('');
-              setWorkingAdText('');
-              setImagePreview(null);
-              setIssues([]);
-            }}
+            onClick={handleFactoryReset}
             className="text-xs px-4 py-2 rounded-full bg-[#F3F4EE] border border-black/10 hover:bg-white text-[#121411] cursor-pointer"
           >
             Clear for Random Judge Input
           </button>
 
-          <div className="flex items-center gap-2 bg-[#F3F4EE] px-3.5 py-2 rounded-full border border-black/10">
-            <span className="text-xs text-[#5E6759]">Active Role:</span>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value)}
-              className="bg-transparent text-xs font-semibold text-[#121411] focus:outline-none cursor-pointer"
+          <LocalAiBadge status={aiStatus} />
+
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-medium text-[#121411]">
+              {currentUser?.avatar} {currentUser?.name}{' '}
+              <span className="text-[#5E6759]">({currentUser?.role})</span>
+            </span>
+            <button
+              onClick={() => {
+                setIsLoggedIn(false);
+                setCurrentUser(null);
+              }}
+              className="text-sm text-red-600 hover:bg-red-50 px-3 py-1 rounded-md border border-red-200 cursor-pointer"
             >
-              <option value="Creator" className="bg-[#F3F4EE] text-[#121411]">Creator (Writer/Designer)</option>
-              <option value="Brand Manager" className="bg-[#F3F4EE] text-[#121411]">Brand Manager (Approver)</option>
-              <option value="Legal Reviewer" className="bg-[#F3F4EE] text-[#121411]">Legal Reviewer (Compliance)</option>
-            </select>
+              Sign Out
+            </button>
           </div>
         </div>
       </header>
@@ -1574,15 +2196,19 @@ export default function App() {
               />
               <button
                 onClick={handleCompileGuidelines}
-                disabled={isExtractingGuideline || (!rawGuidelineText.trim() && visualColors.length === 0)}
-                className="w-full py-2.5 rounded-full bg-[#121411] hover:bg-[#22261f] font-semibold text-sm text-[#D8FF4B] transition cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none"
+                disabled={!hasIngestInput || isExtractingGuideline}
+                className={`w-full py-2.5 rounded-full bg-[#121411] font-semibold text-sm text-[#D8FF4B] transition ${
+                  !hasIngestInput || isExtractingGuideline
+                    ? 'opacity-50 cursor-not-allowed pointer-events-none'
+                    : 'hover:bg-[#22261f] cursor-pointer'
+                }`}
               >
                 {isExtractingGuideline ? (
                   <span className="inline-flex items-center justify-center gap-2">
                     <span className="w-3.5 h-3.5 rounded-full border-2 border-[#D8FF4B]/40 border-t-[#D8FF4B] animate-spin" />
                     {guidelineProgressText || 'Extracting PDF / OCR Guidelines (Please wait)...'}
                   </span>
-                ) : !rawGuidelineText.trim() && visualColors.length === 0 ? (
+                ) : !hasIngestInput ? (
                   'Upload a Brand Deck or Enter Guidelines First'
                 ) : (
                   'Compile Guidelines into Active Rules'
@@ -1594,12 +2220,22 @@ export default function App() {
         {/* TAB 1: COMPILED BRAND VAULT RESULTS — ingestion UI hidden once compiled */}
         {activeTab === 'compiler' && isCompiled && (
           <div className="space-y-4">
-            <button
-              onClick={() => setIsCompiled(false)}
-              className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-full bg-[#F3F4EE] border border-black/10 hover:bg-white text-[#121411] cursor-pointer"
-            >
-              ← Edit Raw Guidelines
-            </button>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <button
+                onClick={() => setIsCompiled(false)}
+                className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-full bg-[#F3F4EE] border border-black/10 hover:bg-white text-[#121411] cursor-pointer"
+              >
+                ← Edit Raw Guidelines
+              </button>
+              {!isExtractingGuideline && (
+                <button
+                  onClick={handleClearVault}
+                  className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-full bg-transparent border border-black/15 hover:border-[#B4463F] hover:text-[#B4463F] text-[#5E6759] cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" /> Clear Extracted Guidelines
+                </button>
+              )}
+            </div>
             <div className="flex flex-col gap-4">
               {/* Compiled Hex Colors */}
               <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
@@ -1620,6 +2256,11 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                {brandVault.colors.length === 0 && (
+                  <p className="text-xs text-[#5E6759]">
+                    No colors detected. Click '+ Add Hex' to manually define the palette.
+                  </p>
+                )}
                 <div className="flex flex-wrap gap-2">
                   {brandVault.colors.map((c) => (
                     <div key={c.id} className="flex items-center gap-2 bg-[#E7E9E0] border border-black/10 px-3 py-1.5 rounded-full text-xs">
@@ -1635,6 +2276,179 @@ export default function App() {
                   ))}
                 </div>
               </div>
+
+              {/* Human-in-the-loop mark selection: the extractor's shortlist stays on
+                  screen until a reviewer confirms one or declares there is none. */}
+              {logoChoicePending && (
+                <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+                  <div className="flex flex-wrap items-start justify-between gap-2 mb-3">
+                    <div>
+                      <h3 className="text-sm font-semibold tracking-tight">Select Primary Brand Mark</h3>
+                      <p className="mt-1 text-[11px] text-[#5E6759] max-w-xl leading-relaxed">
+                        {logoCandidates.length > 0
+                          ? `We shortlisted ${logoCandidates.length} high-contrast regions from the deck. Pick the one that is the real brand mark — the audit compares every banner against it. If the deck only has product imagery, upload the mark yourself or skip.`
+                          : 'No isolated logos detected in document. Upload the official mark, or skip the logo check and audit without a reference lockup.'}
+                      </p>
+                    </div>
+                  </div>
+                  {logoCandidates.length > 0 && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    {logoCandidates.map((candidate, index) => (
+                      <button
+                        key={`${candidate.box?.x || 0}-${candidate.box?.y || 0}-${index}`}
+                        onClick={() => handleSelectLogo(candidate)}
+                        className="group text-left rounded-2xl border border-black/10 bg-white p-2 hover:border-[#121411] transition cursor-pointer"
+                      >
+                        <div className="h-24 flex items-center justify-center overflow-hidden">
+                          {candidate.referenceDataUrl ? (
+                            <img
+                              src={candidate.referenceDataUrl}
+                              alt={`Brand mark candidate ${index + 1}`}
+                              className="max-h-24 max-w-full object-contain"
+                            />
+                          ) : (
+                            <span className="text-[11px] text-[#5E6759]">No preview</span>
+                          )}
+                        </div>
+                        <div className="mt-2 flex items-center justify-between text-[10px] font-mono text-[#5E6759]">
+                          <span>
+                            #{index + 1} · {candidate.logoType === 'wordmark' ? 'Wordmark' : 'Emblem'}
+                          </span>
+                          <span>{candidate.aspectRatio}:1</span>
+                        </div>
+                        <span className="mt-1 inline-block text-[11px] font-semibold text-[#121411] group-hover:underline">
+                          Use this mark
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <label className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-full bg-[#121411] hover:bg-[#22261f] text-[#D8FF4B] cursor-pointer">
+                      <Upload className="w-3.5 h-3.5" /> Upload Logo Manually (Fallback)
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={handleManualLogoUpload}
+                        className="hidden"
+                      />
+                    </label>
+                    <button
+                      onClick={handleSkipLogo}
+                      className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-full bg-transparent border border-black/15 hover:border-[#B4463F] hover:text-[#B4463F] text-[#5E6759] cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />{' '}
+                      {logoCandidates.length > 0 ? 'No Logo Present / Skip' : 'Skip Logo Check'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Compiled Logo Lockup & Usage Conditions — held back only while the
+                  shortlist above is still waiting on a human decision. */}
+              {!logoChoicePending && (brandVault.logoSpec || brandVault.logoConditions) && (
+                <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-sm font-semibold tracking-tight">Compiled Logo Lockup & Usage Conditions</h3>
+                    <span className="text-[10px] uppercase tracking-wider text-[#5E6759]">
+                      {brandVault.logoSpec?.page ? `Source · Page ${brandVault.logoSpec.page}` : 'Text-only rules'}
+                    </span>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-4">
+                    {brandVault.logoSpec?.src || brandVault.logoSpec?.referenceDataUrl ? (
+                      <div className="shrink-0">
+                        <div className="w-32 h-32 rounded-2xl bg-white border border-black/10 flex items-center justify-center p-2 overflow-hidden">
+                          <img
+                            src={brandVault.logoSpec.src || brandVault.logoSpec.referenceDataUrl}
+                            alt={`${brandVault.brandName || 'Brand'} reference logo`}
+                            className="max-w-full max-h-full object-contain"
+                          />
+                        </div>
+                        <p className="mt-2 text-[11px] text-[#5E6759]">
+                          Aspect{' '}
+                          <span className="font-mono text-[#141712]">{brandVault.logoSpec.aspectRatio}:1</span>
+                        </p>
+                      </div>
+                    ) : (
+                      // A deck with no clean emblem gets a vector monogram, never a
+                      // crop of the nearest paragraph.
+                      <div className="shrink-0 w-32 h-32 rounded-2xl bg-[#121411] text-[#D8FF4B] flex flex-col items-center justify-center gap-1">
+                        <span className="text-3xl font-semibold tracking-tight">
+                          {(brandVault.brandName || brandVault.sourceName || 'Brand')
+                            .split(/\s+/)
+                            .filter(Boolean)
+                            .slice(0, 2)
+                            .map((word) => word[0].toUpperCase())
+                            .join('')}
+                        </span>
+                        <span className="text-[9px] uppercase tracking-[0.2em] text-[#D8FF4B]/60">
+                          Brand Mark
+                        </span>
+                      </div>
+                    )}
+                    <div className="flex-1 space-y-3">
+                      {brandVault.logoSpec?.logoColors?.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                          <span className="text-[#5E6759]">Allowed logo colours:</span>
+                          {brandVault.logoSpec.logoColors.map((hex) => (
+                            <span
+                              key={hex}
+                              className="flex items-center gap-1 bg-[#E7E9E0] border border-black/10 px-2 py-0.5 rounded-full font-mono"
+                            >
+                              <span className="w-3 h-3 rounded-full border border-black/10" style={{ backgroundColor: hex }} />
+                              {hex}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="flex flex-wrap gap-1.5">
+                        {[
+                          brandVault.logoConditions?.forbidStretch && 'No Stretching / Distortion',
+                          brandVault.logoConditions?.forbidRecolor && 'Strict Logo Color Lock',
+                          brandVault.logoConditions?.forbidAngle && 'No Angled / Tilted Logo',
+                          brandVault.logoConditions?.requireClearSpace &&
+                            `Clear Space Frame Required${
+                              brandVault.logoConditions?.clearSpaceMultiplier
+                                ? ` (${brandVault.logoConditions.clearSpaceMultiplier})`
+                                : ''
+                            }`,
+                          brandVault.logoConditions?.backgroundGrayscaleRule &&
+                            `Background Grayscale: ${brandVault.logoConditions.backgroundGrayscaleRule.allowed.join(' / ')}`,
+                          brandVault.logoConditions?.minSizeRule && 'Min Size Floor'
+                        ]
+                          .filter(Boolean)
+                          .map((label) => (
+                            <span
+                              key={label}
+                              className="text-[11px] bg-[#D8FF4B]/35 border border-[#121411]/15 text-[#121411] px-2.5 py-1 rounded-full"
+                            >
+                              {label}
+                            </span>
+                          ))}
+                      </div>
+                      {brandVault.logoConditions?.minSizeRule && (
+                        <p className="text-[11px] text-[#2B3129]">
+                          <span className="text-[#5E6759]">Minimum size:</span> {brandVault.logoConditions.minSizeRule}
+                        </p>
+                      )}
+                      {brandVault.logoConditions?.backgroundGrayscaleRule?.deadZone && (
+                        <p className="text-[11px] text-[#2B3129]">
+                          <span className="text-[#5E6759]">Forbidden mid-tone:</span>{' '}
+                          {brandVault.logoConditions.backgroundGrayscaleRule.deadZone[0]}%–
+                          {brandVault.logoConditions.backgroundGrayscaleRule.deadZone[1]}% black
+                        </p>
+                      )}
+                      {brandVault.logoConditions?.improperUseList?.length > 0 && (
+                        <ul className="text-[11px] text-[#2B3129] space-y-0.5 list-disc pl-4">
+                          {brandVault.logoConditions.improperUseList.slice(0, 5).map((item, index) => (
+                            <li key={index}>{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Compiled Banned & Replacement Terminology */}
               <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
@@ -1754,9 +2568,11 @@ export default function App() {
 
         {/* TAB 2: PRE-FLIGHT AD AUDITOR */}
         {activeTab === 'auditor' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-6 flex flex-col gap-4">
-              <div className="bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 flex flex-col gap-3 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+          <div className={`grid grid-cols-1 gap-6 ${hasAudited ? 'lg:grid-cols-12' : ''}`}>
+            <div className={`flex flex-col gap-4 ${hasAudited ? 'lg:col-span-6' : ''}`}>
+              
+
+              <div className="order-1 bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-6 flex flex-col gap-3 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
                 <h2 className="font-semibold text-base tracking-tight">Advertisement Copy & Creative Input</h2>
                 <textarea
                   value={workingAdText}
@@ -1765,8 +2581,17 @@ export default function App() {
                     if (!originalAdText) setOriginalAdText(e.target.value);
                   }}
                   rows={6}
-                  placeholder="Paste any advertisement copy, social caption, or promotional claim to audit..."
-                  className="w-full rounded-2xl bg-[#E7E9E0] border border-black/10 p-3 text-sm text-[#141712] focus:border-[#121411] focus:outline-none"
+                  disabled={textInputLocked}
+                  placeholder={
+                    imagePreview
+                      ? 'Text input disabled while an image is uploaded. Clear the image to enter text.'
+                      : 'Paste any advertisement copy, social caption, or promotional claim to audit...'
+                  }
+                  className={`w-full rounded-2xl border p-3 text-sm text-[#141712] focus:outline-none ${
+                    textInputLocked
+                      ? 'bg-gray-100 border-black/10 opacity-50 cursor-not-allowed'
+                      : 'bg-[#E7E9E0] border-black/10 focus:border-[#121411]'
+                  }`}
                 />
 
                 {/* Banner Image Uploader */}
@@ -1782,16 +2607,28 @@ export default function App() {
                     </span>
                   </div>
                   <label
-                    className={`text-xs bg-[#121411] hover:bg-[#22261f] text-[#D8FF4B] px-3.5 py-1.5 rounded-full whitespace-nowrap ${
-                      isExtractingAdBanner ? 'pointer-events-none opacity-60' : 'cursor-pointer'
+                    className={`text-xs text-[#D8FF4B] px-3.5 py-1.5 rounded-full whitespace-nowrap ${
+                      hasAudited
+                        ? 'bg-gray-600 opacity-50 cursor-not-allowed pointer-events-none'
+                        : imageUploadLocked
+                          ? 'bg-[#121411] opacity-50 cursor-not-allowed pointer-events-none'
+                          : 'bg-[#121411] hover:bg-[#22261f] cursor-pointer'
                     }`}
+                    title={
+                      hasAudited
+                        ? "Click 'Clear Audit & Start Over' to test a new advertisement"
+                        : workingAdText.trim().length > 0
+                          ? 'Clear the ad copy to upload a banner instead.'
+                          : undefined
+                    }
                   >
                     {isExtractingAdBanner ? 'Reading…' : 'Browse Image'}
                     <input
+                      key={adInputKey}
                       type="file"
                       accept="image/*"
                       onChange={handleAdBannerUpload}
-                      disabled={isExtractingAdBanner}
+                      disabled={imageUploadLocked}
                       className="hidden"
                     />
                   </label>
@@ -1811,9 +2648,122 @@ export default function App() {
                         ))}
                       </div>
                     )}
+                    {imageReport?.clipAnalysis && (
+                      <div
+                        className={`flex items-start gap-2 rounded-2xl border px-3 py-2 text-xs leading-relaxed ${
+                          imageReport.clipAnalysis.isVisualMatch
+                            ? 'border-[#B7D77A] bg-[#EDF7DC] text-[#3F5A1F]'
+                            : 'border-[#E4A79F] bg-[#FCE7E3] text-[#8F2D22]'
+                        }`}
+                      >
+                        {/* A badge written by the engine already carries its own icon
+                            and wording; prefixing it again produced "⚠️ CLIP Vision AI:
+                            ⚠️ Vision AI…", so it is rendered as-is. */}
+                        {imageReport.clipAnalysis.overrideBadge || imageReport.clipAnalysis.visionBadge ? (
+                          <span className="font-semibold">
+                            {imageReport.clipAnalysis.overrideBadge || imageReport.clipAnalysis.visionBadge}
+                          </span>
+                        ) : (
+                          <>
+                            <span aria-hidden="true">
+                              {imageReport.clipAnalysis.isVisualMatch ? '👁️' : '⚠️'}
+                            </span>
+                            <span>
+                              <strong className="font-semibold">CLIP Vision AI:</strong>{' '}
+                              {imageReport.clipAnalysis.isVisualMatch
+                                ? `${imageReport.clipAnalysis.brandSceneScore}% Brand Scene Match`
+                                : 'Off-Brand Scene Detected'}
+                              {/* A positive verdict is just the score: the detected
+                                  scene label reads as a caveat and undercuts it. */}
+                              {!imageReport.clipAnalysis.isVisualMatch && (
+                                <span className="opacity-70">
+                                  {` (${imageReport.clipAnalysis.topDetectedScene} · ${imageReport.clipAnalysis.topScore}%)`}
+                                </span>
+                              )}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
+                {(isRunningAudit || visionTelemetry) && (
+                  <div className="relative overflow-hidden rounded-[24px] bg-[#121411] text-[#F3F4EE] p-4">
+                    <style>{`
+                      @keyframes nsOrbit { to { transform: rotate(360deg); } }
+                      @keyframes nsPulse { 0%, 100% { opacity: .35; transform: scale(.9); } 50% { opacity: 1; transform: scale(1.08); } }
+                      @keyframes nsSweep { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+                    `}</style>
+                    <div className="flex items-start gap-3">
+                      <div className="relative w-9 h-9 shrink-0">
+                        <span
+                          className="absolute inset-0 rounded-full border border-[#D8FF4B]/30"
+                          style={{ animation: 'nsPulse 1.6s ease-in-out infinite' }}
+                        />
+                        <span className="absolute inset-0" style={{ animation: 'nsOrbit 2.4s linear infinite' }}>
+                          <span className="absolute left-1/2 top-0 -translate-x-1/2 w-1.5 h-1.5 rounded-full bg-[#D8FF4B]" />
+                          <span className="absolute left-0 bottom-1 w-1 h-1 rounded-full bg-[#8CE04A]" />
+                          <span className="absolute right-0 bottom-1 w-1 h-1 rounded-full bg-[#38BDF8]" />
+                        </span>
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-[10px] uppercase tracking-[0.18em] text-[#D8FF4B]">Live vision telemetry</span>
+                          <span className="text-[10px] font-mono text-[#F3F4EE]/60">
+                            {visionTelemetry?.modelName || VISION_ENGINE_LABEL}
+                          </span>
+                          {visionTelemetry?.hasWebGPU && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-[#38BDF8]/20 text-[#7DD3FC]">WebGPU</span>
+                          )}
+                        </div>
+                        <p className="mt-1 text-xs font-medium leading-snug">
+                          {visionTelemetry?.phase === 'downloading'
+                            ? `Downloading ONNX weights${visionTelemetry?.file ? ` (${visionTelemetry.file})` : ''}…`
+                            : [
+                                'Quantizing vision encoder into browser cache…',
+                                'Scanning banner typography & logo geometry…',
+                                `Cross-checking claims against ${brandVault.sourceName}…`
+                              ][Math.floor(visionElapsed / 1.8) % 3]}
+                        </p>
+                        <p className="mt-0.5 text-[11px] leading-snug text-[#F3F4EE]/55">
+                          {visionTelemetry?.step || 'Orbital reasoning over the uploaded creative…'}
+                        </p>
+                        <div className="mt-2 h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                          <div
+                            className="relative h-full rounded-full bg-gradient-to-r from-[#8CE04A] to-[#D8FF4B] transition-all duration-300"
+                            style={{ width: `${Math.max(4, visionTelemetry?.percent ?? (isRunningAudit ? 12 : 0))}%` }}
+                          >
+                            <span
+                              className="absolute inset-y-0 w-8 bg-white/35 blur-sm"
+                              style={{ animation: 'nsSweep 1.8s linear infinite' }}
+                            />
+                          </div>
+                        </div>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-[#F3F4EE]/65">
+                          <span>Time Elapsed: {visionElapsed.toFixed(1)}s</span>
+                          {visionTelemetry?.etaSec ? <span>Est. Remaining: ~{visionTelemetry.etaSec}s</span> : null}
+                          {visionTelemetry?.percent ? (
+                            <span>
+                              {visionTelemetry.percent}%
+                              {visionTelemetry.totalMB ? ` · ${visionTelemetry.loadedMB} MB / ${visionTelemetry.totalMB} MB` : ''}
+                            </span>
+                          ) : null}
+                          {visionTelemetry?.speedMBps ? <span>{visionTelemetry.speedMBps} MB/s</span> : null}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+
+              {/* Run gate: directly under the engine selector, and the only control
+                  visible before the first audit. */}
+              <div className="order-3 bg-[#F3F4EE] text-[#141712] border border-black/5 rounded-[28px] p-5 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+                <p className="text-[11px] text-[#5E6759] mb-2 leading-relaxed">
+                  Runs every check locally: OCR, WCAG contrast, palette distance, claim verification and the selected vision engine.
+                </p>
                 <button
                   onClick={handleRunAudit}
                   disabled={auditLocked}
@@ -1835,10 +2785,20 @@ export default function App() {
                     'Run Pre-Flight Brand Governance Audit'
                   )}
                 </button>
+                {hasAudited && (
+                  <button
+                    onClick={handleClearAudit}
+                    disabled={isRunningAudit || isExtractingAdBanner}
+                    className="mt-2 w-full py-2.5 rounded-full border border-black/15 bg-transparent text-[#2B3129] hover:border-[#B4463F] hover:text-[#B4463F] font-medium text-xs transition cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" /> Clear Audit &amp; Start Over
+                  </button>
+                )}
               </div>
 
               {/* Surgical Word-Level Diff Viewer */}
-              <div className="relative overflow-hidden bg-[#121411] text-[#F3F4EE] rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.18)]">
+              {hasAudited && (
+              <div className="order-4 relative overflow-hidden bg-[#121411] text-[#F3F4EE] rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.18)]">
                 <LimeWave />
                 <div className="relative z-10">
                   <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
@@ -1878,15 +2838,60 @@ export default function App() {
                   </div>
                 </div>
               </div>
+              )}
             </div>
 
+            {/* Pre-audit: no score exists yet, so the panel shows a neutral, zeroed
+                state rather than a green success card for a run that never happened. */}
+            {!hasAudited && (
+              <div className="flex flex-col gap-4">
+                <div className="bg-[#F3F4EE] text-[#141712] rounded-[28px] p-6 border border-black/5 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <span className="text-[11px] uppercase tracking-wider text-[#5E6759]">Campaign Progress</span>
+                      <h3 className="mt-1 text-lg font-semibold tracking-tight">Awaiting Audit</h3>
+                      <p className="mt-1 text-xs text-[#5E6759]">
+                        Run a Pre-Flight Audit to generate compliance telemetry and trust scores.
+                      </p>
+                    </div>
+                    <span className="w-10 h-10 rounded-full bg-black/5 text-[#5E6759] flex items-center justify-center">
+                      <BarChart3 className="w-4 h-4" />
+                    </span>
+                  </div>
+                  <div className="mt-4 h-1 w-full rounded-full bg-black/10 overflow-hidden">
+                    <div className="h-full rounded-full bg-[#5E6759]/30" style={{ width: '0%' }} />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-[#5E6759]">
+                    <span>Remediation progress</span>
+                    <span>0%</span>
+                  </div>
+                </div>
+                <TrustArcGauge
+                  trustScore={0}
+                  unresolvedCount={0}
+                  overriddenCount={0}
+                  hasAudited={false}
+                  workflowStatus=""
+                />
+              </div>
+            )}
+
             {/* Right Column: Explainable Findings & Surgical Actions */}
+            {hasAudited && (
             <div className="lg:col-span-6 flex flex-col gap-4">
-              <div className="relative overflow-hidden bg-[radial-gradient(120%_120%_at_0%_0%,#D8FF4B_0%,#E4F884_55%,#F3F5EC_100%)] text-[#121510] rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)]">
+              <div
+                className={`relative overflow-hidden text-[#121510] rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.06)] ${
+                  auditAllClear
+                    ? 'bg-[radial-gradient(120%_120%_at_0%_0%,#6EE7B7_0%,#34D399_55%,#ECFDF5_100%)]'
+                    : 'bg-[radial-gradient(120%_120%_at_0%_0%,#D8FF4B_0%,#E4F884_55%,#F3F5EC_100%)]'
+                }`}
+              >
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <span className="text-[11px] uppercase tracking-wider text-[#121510]/60">Campaign Progress</span>
-                    <h3 className="mt-1 text-lg font-semibold tracking-tight">{workflowStatus}</h3>
+                    <h3 className="mt-1 text-lg font-semibold tracking-tight">
+                      {auditAllClear ? '✨ Ready for Publication' : workflowStatus}
+                    </h3>
                     <p className="mt-1 text-xs text-[#121510]/70">
                       {unresolvedCount} unresolved · {Object.keys(overrides).length} overridden · score {trustScore}%
                     </p>
@@ -1921,8 +2926,8 @@ export default function App() {
               <TrustArcGauge
                 trustScore={trustScore}
                 unresolvedCount={unresolvedCount}
-                overriddenCount={Object.keys(overrides).length}
-                totalIssues={issues.length}
+                                    overriddenCount={pendingOverrideCount}
+                passedChecks={governance.passedChecks}
                 hasAudited={hasAudited}
                 workflowStatus={workflowStatus}
               />
@@ -1937,12 +2942,11 @@ export default function App() {
                 ) : (
                   issues.map((iss) => {
                     const isOverridden = Boolean(overrides[iss.id]);
-                    // OCR and visual findings live in the uneditable artwork, so they
-                    // cannot be rewritten by the local text editor.
-                    const isImageIssue = iss.id.startsWith('OCR') || iss.id.startsWith('VIS');
                     // No authored replacement: the reviewer supplies wording, or we
                     // delete the term. A canned token is never inserted.
                     const needsCustomInput = isPlaceholderFix(iss.suggestedFix);
+                    // Is this finding authored copy the editor can actually change?
+                    const editable = isEditableTextIssue(iss, workingAdText, Boolean(imagePreview));
                     return (
                       <div
                         key={iss.id}
@@ -1961,7 +2965,11 @@ export default function App() {
                         <p className="text-xs text-[#2B3129] mb-2">{iss.explanation}</p>
                         <div className="bg-[#E7E9E0] border border-black/10 rounded-2xl p-3 text-xs mb-3">
                           <div className="text-[#B4463F] line-through">Flagged: "{iss.offendingText}"</div>
-                          {needsCustomInput ? (
+                          {!editable ? (
+                            <div className="text-[#5E6759] mt-1">
+                              This finding lives in the artwork — it cannot be rewritten as text.
+                            </div>
+                          ) : needsCustomInput ? (
                             <div className="text-[#5E6759] mt-1">
                               No approved replacement exists for this term — type your own wording or remove it.
                             </div>
@@ -1974,14 +2982,8 @@ export default function App() {
                           <div className="text-xs text-[#8A6D1F] bg-[#E2CC62]/25 border border-[#E2CC62]/60 px-3 py-2 rounded-2xl">
                             Override Requested: "{overrides[iss.id].reason}"
                           </div>
-                        ) : isImageIssue ? (
+                        ) : !editable ? (
                           <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              onClick={() => handleSkipImageIssue(iss)}
-                              className="text-xs border border-black/15 text-[#121411] px-3.5 py-1.5 rounded-full hover:bg-black/5 cursor-pointer"
-                            >
-                              Skip (Keep as is)
-                            </button>
                             <div className="group relative inline-block">
                               <a
                                 href="https://www.canva.com/"
@@ -1999,6 +3001,12 @@ export default function App() {
                                 ⚠️ Warning: Clicking this will open external Canva. You must upload and edit the image manually, which relies on cloud services and affects strict data privacy.
                               </div>
                             </div>
+                            <button
+                              onClick={() => handleRequestOverride(iss)}
+                              className="text-xs bg-[#E7E9E0] hover:bg-[#DDE0D5] text-[#121411] px-3.5 py-1.5 rounded-full cursor-pointer"
+                            >
+                              Request Exception Override
+                            </button>
                           </div>
                         ) : (
                           <div className="space-y-2">
@@ -2013,7 +3021,14 @@ export default function App() {
                               />
                             )}
                             <div className="flex flex-wrap items-center gap-2">
-                              {needsCustomInput ? (
+                              {iss.actionType === 'append-disclaimer' ? (
+                                <button
+                                  onClick={() => handleAppendDisclaimer(iss)}
+                                  className="text-xs bg-[#D8FF4B] hover:bg-[#e6ff7a] text-[#121411] px-3.5 py-1.5 rounded-full font-semibold cursor-pointer"
+                                >
+                                  1-Click Append Legal Disclaimer
+                                </button>
+                              ) : needsCustomInput ? (
                                 <>
                                   <button
                                     onClick={() => handleApplyCustomReplacement(iss)}
@@ -2048,9 +3063,11 @@ export default function App() {
                       </div>
                     );
                   })
-                )}
+                                )}
               </div>
+
             </div>
+            )}
           </div>
         )}
 
@@ -2090,8 +3107,16 @@ export default function App() {
               </div>
               {role === 'Creator' && (
                 <p className="text-xs text-[#121510] bg-[#121510]/10 border border-[#121510]/15 p-3 rounded-2xl">
-                  Switch your role in the top navbar to "Brand Manager" or "Legal Reviewer" to unlock final publication sign-off.
+                  Sign-off is read-only for creators. Sign out and choose "Demo Manager" or "Demo Advocate" on the login screen to unlock final publication sign-off.
                 </p>
+              )}
+              {role === 'Creator' && (
+                <div className="flex items-start gap-2 text-xs text-[#8A6D1F] bg-[#E2CC62]/25 border border-[#E2CC62]/60 p-3 rounded-2xl">
+                  <Lock className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                  <span>
+                    Read-only: exception approvals and rejections are restricted to a Brand Manager (Approver) or Legal / Compliance account, so a creator cannot approve their own override.
+                  </span>
+                </div>
               )}
 
               <div className="space-y-2 bg-[#F3F4EE] text-[#141712] rounded-[24px] p-5 border border-black/5">
@@ -2121,6 +3146,57 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+              <div className="space-y-2 bg-[#F3F4EE] text-[#141712] rounded-[24px] p-5 border border-black/5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-[#5E6759]">
+                    Pending Exception Requests ({pendingOverrideCount})
+                  </h3>
+                  {role === 'Creator' && pendingOverrideCount > 0 && (
+                    <span className="text-[10px] text-[#8A6D1F]">A Brand Manager or Legal Reviewer must decide.</span>
+                  )}
+                </div>
+                {pendingOverrideIssues.length === 0 ? (
+                  <p className="text-xs text-[#5E6759]">No exception requests are waiting for a decision.</p>
+                ) : (
+                  pendingOverrideIssues.map((iss) => {
+                    const request = overrides[iss.id] || {};
+                    const flagged = iss.flaggedText || iss.offendingText || iss.explanation || 'Flagged claim';
+                    return (
+                      <div key={iss.id} className="bg-[#E7E9E0] border border-black/10 p-3 rounded-2xl space-y-2">
+                        <div className="flex flex-wrap items-center gap-2 text-[10px] text-[#5E6759]">
+                          <span className="font-mono px-2 py-0.5 rounded-full bg-white/70 border border-black/10">{iss.id}</span>
+                          <span className="px-2 py-0.5 rounded-full bg-[#E2CC62]/40 border border-[#E2CC62]/60 text-[#8A6D1F]">{iss.category}</span>
+                          <span>{iss.severity} severity</span>
+                        </div>
+                        <p className="text-xs text-[#141712]">
+                          <span className="font-semibold">Flagged text: </span>"{flagged}"
+                        </p>
+                        <p className="text-xs text-[#2B3129] bg-white/60 border border-black/10 rounded-xl px-3 py-2">
+                          <span className="font-semibold">{request.actor || 'Creator'} justification: </span>
+                          {request.reason || 'No justification recorded.'}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => handleApproveOverride(iss)}
+                            disabled={role === 'Creator'}
+                            className="text-xs px-3 py-1.5 rounded-full bg-[#121411] text-[#D8FF4B] hover:bg-[#22261f] font-semibold cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                          >
+                            ✅ Approve Exception
+                          </button>
+                          <button
+                            onClick={() => handleRejectOverride(iss)}
+                            disabled={role === 'Creator'}
+                            className="text-xs px-3 py-1.5 rounded-full border border-[#B4463F]/40 text-[#B4463F] hover:bg-[#B4463F]/10 font-semibold cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                          >
+                            ❌ Reject (Needs Fix)
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
             </div>
 
             <div className="relative overflow-hidden lg:col-span-5 bg-[#121411] text-[#F3F4EE] rounded-[28px] p-6 shadow-[0_12px_32px_rgba(20,24,18,0.18)]">
@@ -2146,8 +3222,8 @@ export default function App() {
                 <TrustArcGauge
                   trustScore={trustScore}
                   unresolvedCount={unresolvedCount}
-                  overriddenCount={Object.keys(overrides).length}
-                  totalIssues={issues.length}
+                                      overriddenCount={pendingOverrideCount}
+                  passedChecks={governance.passedChecks}
                   hasAudited={hasAudited}
                   workflowStatus={workflowStatus}
                 />
@@ -2291,6 +3367,20 @@ export default function App() {
                                   className="mt-1 w-full bg-white/5 border border-white/10 rounded-2xl px-3 py-2 text-[11px] text-[#F3F4EE] focus:border-[#D8FF4B] focus:outline-none resize-y"
                                 />
                               </label>
+                              <button
+                                onClick={() => handleAutoRefineRule(group)}
+                                disabled={autoRefiningId === group.ruleId}
+                                className="mb-2 inline-flex items-center gap-1.5 text-[11px] px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/15 text-[#D8FF4B] cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                              >
+                                {autoRefiningId === group.ruleId ? (
+                                  <>
+                                    <span className="w-3 h-3 rounded-full border-2 border-[#D8FF4B]/30 border-t-[#D8FF4B] animate-spin" />
+                                    Drafting clarified rule…
+                                  </>
+                                ) : (
+                                  '✨ Auto-Refine Ambiguous Rule'
+                                )}
+                              </button>
                               <ul className="space-y-1.5">
                                 {group.entries.map((entry) => (
                                   <li key={entry.issueId} className="bg-white/5 border border-white/10 rounded-2xl px-3 py-2">
@@ -2443,7 +3533,7 @@ export default function App() {
                       signerRole: role,
                       sha256AssetSeal: assetSeal,
                       auditedCopy: workingAdText,
-                      disclosedEngines: ['pdfjs-dist', 'tesseract.js WASM', 'compromise NLP', 'fuse.js', 'HTML5 Canvas WCAG 2.1', 'Web Crypto SHA-256'],
+                      disclosedEngines: ['pdfjs-dist', 'tesseract.js WASM', 'transformers.js WASM (flan-t5-small + MiniLM-L6-v2, on-device)', 'compromise NLP', 'fuse.js', 'HTML5 Canvas WCAG 2.1', 'Web Crypto SHA-256'],
                       cloudDataLeakage: '0 bytes (100% Client-Side Execution)'
                     };
                     const blob = new Blob([JSON.stringify(receipt, null, 2)], { type: 'application/json' });
